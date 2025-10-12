@@ -17,3 +17,9 @@ if google_creds_json:
 else:
     sheet = None
     print("⚠️ ვერ მოხერხდა Sheets-ის დაკავშირება.")
+if sheet:
+    try:
+        sheet.append_row([hotel_name, address, comment, agent_name])
+        print("✅ მონაცემი დაემატა Google Sheets-ში")
+    except Exception as e:
+        print(f"❌ Sheets Error: {e}")
