@@ -1,2 +1,19 @@
 if sheet:
     sheet.append_row([hotel_name, address, comment, agent_name])
+import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Sheets setup
+google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if google_creds_json:
+    creds_dict = json.loads(google_creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
+
+    SPREADSHEET_ID = "შენი_ცხრილის_ID_აქ_ჩასვი"
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+else:
+    sheet = None
+    print("⚠️ ვერ მოხერხდა Sheets-ის დაკავშირება.")
