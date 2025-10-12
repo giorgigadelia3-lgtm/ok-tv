@@ -185,4 +185,10 @@ def index():
     return 'Telegram Hotel Claim Bot is running.'
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Register webhook with Telegram when the app starts
+    webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    set_resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
+    print("Set webhook response:", set_resp.text)
+
+    # Run Flask server
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000))
