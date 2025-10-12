@@ -1,0 +1,2 @@
+if sheet:
+    sheet.append_row([hotel_name, address, comment, agent_name])
