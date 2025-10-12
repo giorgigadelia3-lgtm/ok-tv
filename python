@@ -1,25 +1,65 @@
-if sheet:
-    sheet.append_row([hotel_name, address, comment, agent_name])
 import os
 import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Sheets setup
-google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if google_creds_json:
+# -----------------------------
+# ✅ Google Sheets დაკავშირება
+# -----------------------------
+
+try:
+    # JSON credentials Render-ზე შენახული უნდა იყოს Environment Variable-ში სახელად GOOGLE_APPLICATION_CREDENTIALS_JSON
+    google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+    if not google_creds_json:
+        raise Exception("❌ GOOGLE_APPLICATION_CREDENTIALS_JSON არ მოიძებნა Render-ზე.")
+
     creds_dict = json.loads(google_creds_json)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+
+    # უფრო ფართო უფლებებით (Drive access + Spreadsheet access)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
 
-    SPREADSHEET_ID = 1zKL6iFYEw6rUX89MtYUpE9OAUMxIHq3cOQmdL_y2H9E
+    # შენი Sheet ID (მხოლოდ შუა ნაწილი ბმულიდან!)
+    SPREADSHEET_ID = "1zKL6iFYEw6rUX89MtYUpE9OAUMxIHq3cOQmdL_y2H9E"
+
+    # უკავშირდება პირველ worksheet-ს
     sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-else:
+    print("✅ წარმატებით დაუკავშირდა Google Sheets-ს")
+
+except Exception as e:
     sheet = None
-    print("⚠️ ვერ მოხერხდა Sheets-ის დაკავშირება.")
-if sheet:
+    print(f"⚠️ Sheets დაკავშირების შეცდომა: {e}")
+
+
+# -----------------------------
+# ✅ მონაცემების შენახვის ფუნქცია
+# -----------------------------
+def save_to_sheet(hotel_name, address, comment, agent_name):
+    if not sheet:
+        print("⚠️ Sheets მიუწვდომელია — მონაცემები ვერ ჩაიწერება.")
+        return
+
     try:
         sheet.append_row([hotel_name, address, comment, agent_name])
         print("✅ მონაცემი დაემატა Google Sheets-ში")
     except Exception as e:
         print(f"❌ Sheets Error: {e}")
+
+
+# -----------------------------
+# 💡 ტესტად შეგიძლია ეს გააშვებ ადგილობრივად:
+# -----------------------------
+if __name__ == "__main__":
+    # ტესტ მონაცემი
+    test_hotel = "Green Hotel"
+    test_address = "ზურაბ აგლაძის 5"
+    test_comment = "მივყიდე სრული პაკეტი"
+    test_agent = "მარიამ ჯუღელი"
+
+    save_to_sheet(test_hotel, test_address, test_comment, test_agent)
