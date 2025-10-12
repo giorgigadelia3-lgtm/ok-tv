@@ -1,3 +1,21 @@
+import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+
+# --- Google Sheets ავტორიზაცია ---
+google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if google_creds_json:
+    creds_dict = json.loads(google_creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
+
+    # ჩაანაცვლე შენი ცხრილის ID-ით (ნახავ URL-ში: https://docs.google.com/spreadsheets/d/🟩_აქაა_ID_🟩/edit)
+    SPREADSHEET_ID = "აქ ჩასვი შენი Google Sheet ID"
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+else:
+    sheet = None
+    print("⚠️ Google Sheets ავტორიზაცია ვერ შესრულდა.")
 # telegram_hotel_claim_bot.py
 # -*- coding: utf-8 -*-
 """
