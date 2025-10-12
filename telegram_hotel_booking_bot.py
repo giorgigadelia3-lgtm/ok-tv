@@ -1,300 +1,251 @@
-#!/usr/bin/env python3
+# telegram_hotel_claim_bot.py
 # -*- coding: utf-8 -*-
 """
-OK TV — Telegram Chatbot for corporate-offers management
-Author: Generated (assistant)
-Requirements: python-telegram-bot>=20.0, APScheduler (optional), python-dotenv
-DB: SQLite (file-based, portable)
-Usage:
-  - create .env with BOT_TOKEN and ADMIN_CHAT_ID (or comma-separated IDs)
-  - python3 bot.py
+HotelClaimBot — Telegram webhook-based bot for searching and registering hotel/corporation offers.
+
+Flow:
+- User presses "მოძებნე. 🔍"
+- Bot asks for name to search
+  - if exists -> "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️" (end)
+  - if not exists -> "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️" + show Start button
+- If user presses Start -> registration flow:
+  1) "კორპორაციის დასახელება. 🏢"
+  2) "მისამართი. 📍"
+  3) "კომენტარი. 📩"
+  4) "აგენტის სახელი და გვარი. 👩‍💻"
+  -> Save to SQLite and reply "OK TV გისურვებთ წარმატებულ დღეს. 🥰"
+
+Command:
+/myhotels - list saved records
 """
 
 import os
 import sqlite3
-import csv
+import time
+import requests
 from datetime import datetime
-from functools import wraps
+from flask import Flask, request, jsonify
 
-from telegram import (
-    __version__ as TG_VER,
-)
-# ensure using telegram v20+ API
-try:
-    from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
-    from telegram.ext import (
-        ApplicationBuilder,
-        CommandHandler,
-        ContextTypes,
-        MessageHandler,
-        filters,
-        ConversationHandler,
-    )
-except Exception as e:
-    raise RuntimeError("python-telegram-bot v20+ is required. Install with: pip install python-telegram-bot --upgrade") from e
-
-# ---- CONFIGURATION (environment variables) ----
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # required
-ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_ID", "")  # comma separated chat id(s)
-DB_PATH = os.getenv("DB_PATH", "oktv_offers.db")
-
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise SystemExit("Please set BOT_TOKEN environment variable (e.g., in .env)")
+    raise RuntimeError("Please set BOT_TOKEN environment variable")
 
-# parse admin ids
-ADMIN_IDS = []
-if ADMIN_CHAT_IDS:
-    for s in ADMIN_CHAT_IDS.split(","):
-        s = s.strip()
-        if s:
-            try:
-                ADMIN_IDS.append(int(s))
-            except ValueError:
-                print(f"Warning: invalid ADMIN_CHAT_ID value: {s}")
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+DB_PATH = "data.db"
 
-# ---- Database helpers ----
-def init_db(path=DB_PATH):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS offers (
+app = Flask(__name__)
+
+# ---------------- Database helpers ----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS hotels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hotel_name TEXT UNIQUE,
-            corp_name TEXT,
+            name TEXT NOT NULL,
             address TEXT,
             comment TEXT,
-            agent_name TEXT,
-            submitted_by INTEGER,
-            submitted_at TEXT
+            agent TEXT,
+            created_at INTEGER
         )
-        """
-    )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS pending (
+            chat_id INTEGER PRIMARY KEY,
+            state TEXT,
+            temp_name TEXT,
+            temp_address TEXT,
+            temp_comment TEXT
+        )
+    ''')
     conn.commit()
-    return conn
+    conn.close()
 
-DB = init_db(DB_PATH)
+def db_execute(query, params=(), fetch=False):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(query, params)
+    data = None
+    if fetch:
+        data = cur.fetchall()
+    conn.commit()
+    conn.close()
+    return data
 
-def hotel_exists(hotel_name: str) -> bool:
-    c = DB.cursor()
-    c.execute("SELECT 1 FROM offers WHERE lower(hotel_name)=lower(?) LIMIT 1", (hotel_name.strip(),))
-    return c.fetchone() is not None
+init_db()
 
-def save_offer(hotel_name, corp_name, address, comment, agent_name, submitted_by):
-    c = DB.cursor()
-    now = datetime.utcnow().isoformat()
-    try:
-        c.execute(
-            "INSERT INTO offers (hotel_name, corp_name, address, comment, agent_name, submitted_by, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (hotel_name.strip(), corp_name.strip(), address.strip(), comment.strip(), agent_name.strip(), submitted_by, now),
-        )
-        DB.commit()
-        return True
-    except sqlite3.IntegrityError:
-        # already exists (race condition)
-        return False
+# ---------------- Utilities ----------------
+def normalize(s: str) -> str:
+    return " ".join(s.strip().lower().split()) if s else ""
 
-def list_offers(limit=100):
-    c = DB.cursor()
-    c.execute("SELECT id, hotel_name, corp_name, address, comment, agent_name, submitted_by, submitted_at FROM offers ORDER BY id DESC LIMIT ?", (limit,))
-    rows = c.fetchall()
-    return rows
+# ---------------- Business logic ----------------
+def hotel_exists_by_name(name: str):
+    n = normalize(name)
+    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(name)=?", (n,), fetch=True)
+    return rows[0] if rows else None
 
-def export_offers_csv(path="oktv_offers_export.csv"):
-    rows = list_offers(limit=1000000)
-    header = ["id","hotel_name","corp_name","address","comment","agent_name","submitted_by","submitted_at"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
-    return path
-
-# ---- Conversation states ----
-(
-    STATE_WAIT_SEARCH,       # after /start -> we show "მოძებნე. 🔍"
-    STATE_WAIT_HOTEL_NAME,   # user types hotel name to check
-    STATE_CORP_NAME,         # ask "კორპორაციის დასახელება. 🏢"
-    STATE_ADDRESS,           # ask "მისამართი. 📍"
-    STATE_COMMENT,           # ask "კომენტარი. 📩"
-    STATE_AGENT_NAME,        # ask "აგენტის სახელი და გვარი. 👩‍💻"
-) = range(6)
-
-# ---- Admin only decorator ----
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id if update.effective_user else None
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("გვერდზე წვდომა მხოლოდ ადმინისტრატორს აქვს.")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-# ---- Bot Handlers ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point: send the initial button 'მოძებნე. 🔍'"""
-    # create simple keyboard with single button
-    kb = ReplyKeyboardMarkup([[KeyboardButton("მოძებნე. 🔍")]], resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text(
-        "გამარჯობა! გამოიყენე ღილაკი ან დაწერე 'მოძებნე. 🔍' — სასტუმროს დასახელების შესამოწმებლად.",
-        reply_markup=kb
+def add_hotel(name, address, comment, agent):
+    ts = int(time.time())
+    db_execute(
+        "INSERT INTO hotels (name, address, comment, agent, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name.strip(), address.strip() if address else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
     )
-    return STATE_WAIT_HOTEL_NAME
 
-async def search_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """When user presses the search button or sends any text intended as hotel name."""
-    text = update.message.text.strip()
-    # If user literally pressed button, we ask them to type the hotel name
-    if text == "მოძებნე. 🔍":
-        await update.message.reply_text("გთხოვთ, დაწერეთ სასტუმროს სახელი (სახელით).", reply_markup=ReplyKeyboardRemove())
-        return STATE_WAIT_HOTEL_NAME
+def get_all_hotels():
+    return db_execute("SELECT id, name, address, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
 
-    # Otherwise, treat incoming text as hotel name directly (user typed it)
-    return await handle_hotel_name(update, context, text=text)
-
-async def handle_hotel_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
-    """Main check: if hotel exists -> end with ❌. Else -> continue sequence."""
-    if text is None:
-        text = update.message.text.strip()
-
-    hotel_name = text.strip()
-    if not hotel_name:
-        await update.message.reply_text("სახელის ველი ცარიელია — გთხოვთ, მიაწოდოთ სასტუმროს სახელი.")
-        return STATE_WAIT_HOTEL_NAME
-
-    # Check DB
-    if hotel_exists(hotel_name):
-        await update.message.reply_text("კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=ReplyKeyboardRemove())
-        # conversation ends
-        return ConversationHandler.END
-    else:
-        # new — inform and continue
-        await update.message.reply_text("კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️", reply_markup=ReplyKeyboardRemove())
-        # store initial hotel_name in user_data
-        context.user_data['hotel_name'] = hotel_name
-        # Next prompt sequence as requested
-        await update.message.reply_text("კორპორაციის დასახელება. 🏢")
-        return STATE_CORP_NAME
-
-async def corp_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    context.user_data['corp_name'] = text
-    await update.message.reply_text("მისამართი. 📍")
-    return STATE_ADDRESS
-
-async def address_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    context.user_data['address'] = text
-    await update.message.reply_text("კომენტარი. 📩")
-    return STATE_COMMENT
-
-async def comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    context.user_data['comment'] = text
-    await update.message.reply_text("აგენტის სახელი და გვარი. 👩‍💻")
-    return STATE_AGENT_NAME
-
-async def agent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    context.user_data['agent_name'] = text
-
-    # Gather all saved info
-    hotel_name = context.user_data.get('hotel_name') or ""
-    corp_name = context.user_data.get('corp_name') or hotel_name
-    address = context.user_data.get('address') or ""
-    comment = context.user_data.get('comment') or ""
-    agent_name = context.user_data.get('agent_name') or ""
-    submitted_by = update.effective_user.id if update.effective_user else None
-
-    # Save to DB
-    saved = save_offer(hotel_name=hotel_name, corp_name=corp_name, address=address, comment=comment, agent_name=agent_name, submitted_by=submitted_by)
-    if not saved:
-        # conflict (race)
-        await update.message.reply_text("მოხდა შეცდომა: მსგავსი კორპორაცია უკვე დამატებულია. სტატი ფარავს. ❌️")
-        return ConversationHandler.END
-
-    # Notify admin(s) with full details
-    msg = (
-        f"📥 ახალი ნასტავსება დარეგისტრირდა:\n\n"
-        f"🏨 სასტუმრო/კორპორაცია: {hotel_name}\n"
-        f"🏢 კორპორაციის დასახელება: {corp_name}\n"
-        f"📍 მისამართი: {address}\n"
-        f"📩 კომენტარი: {comment}\n"
-        f"👩‍💻 აგენტი: {agent_name}\n"
-        f"🆔 შეტყობინების ავტორი (TG id): {submitted_by}\n"
-        f"🕒 დრო (UTC): {datetime.utcnow().isoformat()}\n"
+# ---------------- Pending flow helpers ----------------
+def set_pending(chat_id, state, temp_name=None, temp_address=None, temp_comment=None):
+    db_execute(
+        "REPLACE INTO pending (chat_id, state, temp_name, temp_address, temp_comment) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, state, temp_name, temp_address, temp_comment)
     )
-    # send to each admin if set
-    for aid in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=aid, text=msg)
-        except Exception:
-            print(f"Warning: couldn't send admin notification to {aid}")
 
-    # Final user message and end conversation
-    await update.message.reply_text("OK TV გისურვებთ წარმატებულ დღეს. 🥰")
-    return ConversationHandler.END
+def get_pending(chat_id):
+    rows = db_execute("SELECT state, temp_name, temp_address, temp_comment FROM pending WHERE chat_id=?", (chat_id,), fetch=True)
+    if rows:
+        return rows[0]
+    return (None, None, None, None)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ოპერაცია გაუქმდა.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
+def clear_pending(chat_id):
+    db_execute("DELETE FROM pending WHERE chat_id=?", (chat_id,))
 
-# ---- Admin commands ----
-@admin_only
-async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = list_offers(limit=50)
-    if not rows:
-        await update.message.reply_text("DB ცარიელია — არ მოხვედრილა ჩანაწერი.")
-        return
-    texts = []
-    for r in rows:
-        (id_, hotel_name, corp_name, address, comment, agent_name, submitted_by, submitted_at) = r
-        texts.append(f"{id_}. {hotel_name} | {corp_name} | {agent_name} | {submitted_at}")
-    # send in chunks if long
-    chunk_size = 10
-    for i in range(0, len(texts), chunk_size):
-        await update.message.reply_text("\n".join(texts[i:i+chunk_size]))
-
-@admin_only
-async def admin_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    path = export_offers_csv()
-    await update.message.reply_text(f"ექსპორტი მზად: {path}")
-    # send file as document
+# ---------------- Telegram helpers ----------------
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(path, "rb"))
+        r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+        return r.json()
     except Exception as e:
-        await update.message.reply_text(f"ფაილის გაგზავნა ვერ მოხერხდა: {e}")
+        print("Failed to send message:", e)
+        return None
 
-# ---- Build application and handlers ----
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def keyboard_search_only():
+    return {"keyboard": [[{"text": "მოძებნე. 🔍"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-    # Conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            STATE_WAIT_HOTEL_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, search_button_pressed)
-            ],
-            STATE_CORP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, corp_name_handler)],
-            STATE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_handler)],
-            STATE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment_handler)],
-            STATE_AGENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, agent_handler)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
+def keyboard_main():
+    return {"keyboard": [[{"text": "მოძებნე. 🔍"}, {"text": "დაწყება / start. 🚀"}], [{"text": "/myhotels"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-    app.add_handler(conv_handler)
+def keyboard_start_only():
+    return {"keyboard": [[{"text": "დაწყება / start. 🚀"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-    # admin commands
-    app.add_handler(CommandHandler("list", admin_list))
-    app.add_handler(CommandHandler("export", admin_export))
-    app.add_handler(CommandHandler("cancel", cancel))
+# ---------------- Webhook handler ----------------
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    update = request.get_json(force=True)
+    if 'message' not in update:
+        return jsonify({"ok": True})
 
-    print("Bot started. Press Ctrl+C to stop.")
-    app.run_polling()
+    msg = update['message']
+    chat_id = msg['chat']['id']
+    text = msg.get('text', '').strip()
+    if not text:
+        return jsonify({"ok": True})
 
-if __name__ == "__main__":
-    main()
+    # Command to view DB
+    if text.strip().lower() in ('/myhotels', 'myhotels'):
+        rows = get_all_hotels()
+        if not rows:
+            send_message(chat_id, "ჩანაწერები არ მოიძებნა.", reply_markup=keyboard_main())
+        else:
+            out = "<b>ჩაწერილი კორპორაციები / სასტუმროები:</b>\n"
+            for r in rows:
+                hid, name, address, comment, agent, ts = r
+                dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                out += f"\n🏷️ <b>{name}</b>\n📍 {address or '-'}\n📝 {comment or '-'}\n👤 {agent or '-'}\n⏱ {dt}\n"
+            send_message(chat_id, out, reply_markup=keyboard_main())
+        return jsonify({"ok": True})
 
+    # Start flows
+    # If user pressed search:
+    if text in ("მოძებნე. 🔍", "მოძებნე", "მოძებნე 🔍"):
+        set_pending(chat_id, "awaiting_search_name")
+        send_message(chat_id, "გთხოვ, ჩაწერეთ სასტუმროს/კორპორაციის სახელი საძიებლად.", reply_markup=keyboard_search_only())
+        return jsonify({"ok": True})
+
+    # If user presses start button to begin registration
+    if text in ("დაწყება / start. 🚀", "start", "/start"):
+        # If the user had previously searched and we have temp_name, begin from that; otherwise ask for name.
+        state, temp_name, temp_address, temp_comment = get_pending(chat_id)
+        if temp_name:
+            set_pending(chat_id, "awaiting_name", temp_name=temp_name)
+            send_message(chat_id, "დავიწყოთ რეგისტრაცია. პირველი, გთხოვთ დაადასტურეთ ან ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
+        else:
+            set_pending(chat_id, "awaiting_name")
+            send_message(chat_id, "დავიწყოთ რეგისტრაცია. გთხოვთ ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # handle pending states
+    state, temp_name, temp_address, temp_comment = get_pending(chat_id)
+
+    # Search state: user types name to check
+    if state == "awaiting_search_name":
+        search_name = text
+        existing = hotel_exists_by_name(search_name)
+        if existing:
+            send_message(chat_id, "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+        else:
+            # not exists
+            set_pending(chat_id, "ready_to_register", temp_name=search_name)
+            send_message(chat_id, "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️\n\nთუ გსურთ, შეყვანა (რეგისტრაცია) ჩააბათ მაშინ დააჭირეთ ღილაკს \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
+            return jsonify({"ok": True})
+
+    # awaiting_name - from start flow
+    if state == "awaiting_name":
+        # Accept name (either typed or confirm temp_name)
+        name_val = text
+        # store and move to address
+        set_pending(chat_id, "awaiting_address", temp_name=name_val)
+        send_message(chat_id, "კორპორაციის დასახელება მიღებულია. გთხოვთ ჩაწერეთ — <b>მისამართი. 📍</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_address
+    if state == "awaiting_address":
+        address = text
+        set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=address)
+        send_message(chat_id, "მისამართი მიღებულია. გთხოვთ ჩაწერეთ — <b>კომენტარი. 📩</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_comment
+    if state == "awaiting_comment":
+        comment = text
+        set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_comment=comment)
+        send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწერეთ — <b>აგენტის სახელი და გვარი. 👩‍💻</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_agent
+    if state == "awaiting_agent":
+        agent = text
+        if not temp_name:
+            send_message(chat_id, "ხარვეზი: სახელი არ მოიძებნა. გთხოვთ დაიწყოთ თავიდან ღილაკით \"მოძებნე. 🔍\" ან დააჭირეთ \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+        # Save to DB
+        add_hotel(temp_name, temp_address or "", temp_comment or "", agent or "")
+        clear_pending(chat_id)
+        send_message(chat_id, "OK TV გისურვებთ წარმატებულ დღეს. 🥰", reply_markup=keyboard_main())
+        return jsonify({"ok": True})
+
+    # No known flow: nudge user to search
+    send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით \"მოძებნე. 🔍\" საწყისისთვის ან გამოიყენეთ /myhotels რათა ნახოთ ჩანაწერები.", reply_markup=keyboard_main())
+    return jsonify({"ok": True})
+
+# index
+@app.route('/')
+def index():
+    return "HotelClaimBot is running."
+
+# set webhook on start (optional; will try)
+if __name__ == '__main__':
+    webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    try:
+        r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
+        print("Webhook set response:", r.text)
+    except Exception as e:
+        print("Failed to set webhook automatically:", e)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
