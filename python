@@ -12,7 +12,7 @@ if google_creds_json:
     creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     client = gspread.authorize(creds)
 
-    SPREADSHEET_ID = "შენი_ცხრილის_ID_აქ_ჩასვი"
+    SPREADSHEET_ID = 1zKL6iFYEw6rUX89MtYUpE9OAUMxIHq3cOQmdL_y2H9E
     sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 else:
     sheet = None
