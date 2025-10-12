@@ -13,7 +13,7 @@ if not BOT_TOKEN:
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DB_PATH = 'data.db'
 
-app = Flask(_name_)
+app = Flask(__name__)
 
 # ---------- DATABASE ----------
 def init_db():
