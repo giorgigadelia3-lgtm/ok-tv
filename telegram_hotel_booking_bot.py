@@ -1,248 +1,269 @@
-# telegram_hotel_booking_bot.py
-"""
-Telegram HotelClaimBot
-Flow:
- - Primary buttons: "მოძებნე. 🔍"  and "დაწყება / start. 🚀"
- - "მოძებნე. 🔍" asks for hotel name, checks Google Sheet:
-     - if exists -> "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️" and end
-     - if not exists -> "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️" and show Start button
- - "დაწყება / start. 🚀" starts form:
-     - corporate name (if not already),
-     - address,
-     - comment,
-     - agent name
- - At the end, saves a row to Google Sheet with: hotel, address, comment, agent, user, timestamp
-Important env vars (on Render):
- - BOT_TOKEN
- - SPREADSHEET_ID
- - GOOGLE_APPLICATION_CREDENTIALS_JSON  (full JSON content of service account)
- - (optional) WEBHOOK_URL (https://<your-render-url>/<BOT_TOKEN>)
-"""
-
 import os
 import json
-import logging
-from datetime import datetime
-
-from flask import Flask, request, jsonify
-import telebot
-from telebot import types
-
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hotelclaimbot")
+# --- Google Sheets ავტორიზაცია ---
+google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if google_creds_json:
+    creds_dict = json.loads(google_creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
 
-# ---------- Environment ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional: e.g. https://ok-tv-1.onrender.com/<BOT_TOKEN>
-
-if not BOT_TOKEN:
-    logger.error("Missing BOT_TOKEN environment variable.")
-    raise SystemExit("BOT_TOKEN environment variable is required.")
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
-
-# ---------- Google Sheets connection ----------
-sheet = None
-try:
-    if not GOOGLE_CREDS_JSON:
-        raise Exception("GOOGLE_APPLICATION_CREDENTIALS_JSON is missing in environment.")
-
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    if not SPREADSHEET_ID:
-        raise Exception("SPREADSHEET_ID environment variable is missing.")
-
-    sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-    logger.info("Connected to Google Sheets successfully.")
-except Exception as e:
+    # ჩაანაცვლე შენი ცხრილის ID-ით (ნახავ URL-ში: https://docs.google.com/spreadsheets/d/🟩_აქაა_ID_🟩/edit)
+    SPREADSHEET_ID = "აქ ჩასვი შენი Google Sheet ID"
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+else:
     sheet = None
-    logger.warning(f"Google Sheets not available: {e}")
+    print("⚠️ Google Sheets ავტორიზაცია ვერ შესრულდა.")
+# telegram_hotel_claim_bot.py
+# -- coding: utf-8 --
+"""
+HotelClaimBot — Telegram webhook-based bot for searching and registering hotel/corporation offers.
 
-# ---------- In-memory state for chat flows ----------
-# Structure: user_states[chat_id] = {"hotel_name":..., "address":..., "comment":..., "agent":...}
-user_states = {}
+Flow:
+- User presses "მოძებნე. 🔍"
+- Bot asks for name to search
+  - if exists -> "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️" (end)
+  - if not exists -> "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️" + show Start button
+- If user presses Start -> registration flow:
+  1) "კორპორაციის დასახელება. 🏢"
+  2) "მისამართი. 📍"
+  3) "კომენტარი. 📩"
+  4) "აგენტის სახელი და გვარი. 👩‍💻"
+  -> Save to SQLite and reply "OK TV გისურვებთ წარმატებულ დღეს. 🥰"
 
-# ---------- Helper functions ----------
-def check_hotel_exists(hotel_name: str) -> bool:
-    """Return True if hotel_name exists in column A (case-insensitive)."""
-    if not sheet:
-        logger.warning("check_hotel_exists: sheet is not available.")
-        return False
+Command:
+/myhotels - list saved records
+"""
+
+import os
+import sqlite3
+import time
+import requests
+from datetime import datetime
+from flask import Flask, request, jsonify
+
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Please set BOT_TOKEN environment variable")
+
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+DB_PATH = "data.db"
+
+app = Flask(_name_)
+
+# ---------------- Database helpers ----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS hotels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT,
+            comment TEXT,
+            agent TEXT,
+            created_at INTEGER
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS pending (
+            chat_id INTEGER PRIMARY KEY,
+            state TEXT,
+            temp_name TEXT,
+            temp_address TEXT,
+            temp_comment TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def db_execute(query, params=(), fetch=False):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(query, params)
+    data = None
+    if fetch:
+        data = cur.fetchall()
+    conn.commit()
+    conn.close()
+    return data
+
+init_db()
+
+# ---------------- Utilities ----------------
+def normalize(s: str) -> str:
+    return " ".join(s.strip().lower().split()) if s else ""
+
+# ---------------- Business logic ----------------
+def hotel_exists_by_name(name: str):
+    n = normalize(name)
+    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(name)=?", (n,), fetch=True)
+    return rows[0] if rows else None
+
+def add_hotel(name, address, comment, agent):
+    ts = int(time.time())
+    db_execute(
+        "INSERT INTO hotels (name, address, comment, agent, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name.strip(), address.strip() if address else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
+    )
+
+def get_all_hotels():
+    return db_execute("SELECT id, name, address, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
+
+# ---------------- Pending flow helpers ----------------
+def set_pending(chat_id, state, temp_name=None, temp_address=None, temp_comment=None):
+    db_execute(
+        "REPLACE INTO pending (chat_id, state, temp_name, temp_address, temp_comment) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, state, temp_name, temp_address, temp_comment)
+    )
+
+def get_pending(chat_id):
+    rows = db_execute("SELECT state, temp_name, temp_address, temp_comment FROM pending WHERE chat_id=?", (chat_id,), fetch=True)
+    if rows:
+        return rows[0]
+    return (None, None, None, None)
+
+def clear_pending(chat_id):
+    db_execute("DELETE FROM pending WHERE chat_id=?", (chat_id,))
+
+# ---------------- Telegram helpers ----------------
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
-        colA = sheet.col_values(1)  # read column A (hotel names)
-        target = hotel_name.strip().lower()
-        for v in colA:
-            if v and v.strip().lower() == target:
-                return True
-        return False
+        r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+        return r.json()
     except Exception as e:
-        logger.error(f"Error checking hotel existence: {e}")
-        return False
+        print("Failed to send message:", e)
+        return None
 
-def save_to_sheet(hotel, address, comment, agent, user_fullname):
-    """Append a row to the Google Sheet. Returns True on success."""
-    if not sheet:
-        logger.error("save_to_sheet: sheet is not available.")
-        return False
-    try:
-        row = [
-            hotel,
-            address,
-            comment,
-            agent,
-            user_fullname,
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        ]
-        sheet.append_row(row)
-        logger.info(f"Appended row to sheet: {row}")
-        return True
-    except Exception as e:
-        logger.exception(f"Failed to append row to sheet: {e}")
-        return False
+def keyboard_search_only():
+    return {"keyboard": [[{"text": "მოძებნე. 🔍"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-# ---------- Keyboards ----------
-def main_keyboard():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    kb.row(types.KeyboardButton("მოძებნე. 🔍"), types.KeyboardButton("დაწყება / start. 🚀"))
-    return kb
+def keyboard_main():
+    return {"keyboard": [[{"text": "მოძებნე. 🔍"}, {"text": "დაწყება / start. 🚀"}], [{"text": "/myhotels"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-def start_only_keyboard():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.row(types.KeyboardButton("დაწყება / start. 🚀"))
-    return kb
+def keyboard_start_only():
+    return {"keyboard": [[{"text": "დაწყება / start. 🚀"}]], "resize_keyboard": True, "one_time_keyboard": False}
 
-# ---------- Handlers ----------
-@bot.message_handler(commands=["start"])
-def cmd_start(m):
-    chat_id = m.chat.id
-    user_states.pop(chat_id, None)
-    bot.send_message(chat_id, "👋 სალამი! დააჭირე 'მოძებნე. 🔍' ძიებისთვის ან 'დაწყება / start. 🚀' ჩასაწერად.", reply_markup=main_keyboard())
-
-@bot.message_handler(func=lambda msg: msg.text and msg.text.strip().lower() == "მოძებნე. 🔍")
-def handle_search(msg):
-    chat_id = msg.chat.id
-    user_states.pop(chat_id, None)
-    sent = bot.send_message(chat_id, "გთხოვთ ჩაწეროთ სასტუმროს ან კორპორაციის სახელი, რომლის სტატუსს გსურთ შემოწმება:")
-    bot.register_next_step_handler(sent, process_search_input)
-
-def process_search_input(msg):
-    chat_id = msg.chat.id
-    hotel_name = (msg.text or "").strip()
-    if not hotel_name:
-        s = bot.send_message(chat_id, "სახელი ცარიელია. გთხოვთ ჩაწეროთ სასტუმროს/კორპორაციის სახელი:")
-        bot.register_next_step_handler(s, process_search_input)
-        return
-
-    exists = check_hotel_exists(hotel_name)
-    if exists:
-        bot.send_message(chat_id, "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=types.ReplyKeyboardRemove())
-        user_states.pop(chat_id, None)
-        return
-    else:
-        user_states[chat_id] = {"hotel_name": hotel_name}
-        bot.send_message(chat_id, "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️")
-        # show start button to continue filling
-        bot.send_message(chat_id, "თუ გსურთ ახლა შეავსოთ დამატებითი ინფორმაცია, დააჭირეთ \"დაწყება / start. 🚀\"", reply_markup=start_only_keyboard())
-
-@bot.message_handler(func=lambda msg: msg.text and msg.text.strip().lower() == "დაწყება / start. 🚀")
-def handle_start_fill(msg):
-    chat_id = msg.chat.id
-    state = user_states.get(chat_id, {})
-    # If we already have hotel_name from search -> move to address prompt
-    if "hotel_name" in state and state["hotel_name"]:
-        s = bot.send_message(chat_id, "მისამართი. 📍")
-        bot.register_next_step_handler(s, ask_comment)
-        return
-    # otherwise ask for hotel name first
-    s = bot.send_message(chat_id, "კორპორაციის დასახელება. 🏢")
-    bot.register_next_step_handler(s, ask_address)
-
-def ask_address(msg):
-    chat_id = msg.chat.id
-    hotel = (msg.text or "").strip()
-    if not hotel:
-        s = bot.send_message(chat_id, "სახელი ცარიელია. გთხოვთ ჩაწეროთ კორპორაციის დასახელება:")
-        bot.register_next_step_handler(s, ask_address)
-        return
-    user_states.setdefault(chat_id, {})["hotel_name"] = hotel
-    s = bot.send_message(chat_id, "მისამართი. 📍")
-    bot.register_next_step_handler(s, ask_comment)
-
-def ask_comment(msg):
-    chat_id = msg.chat.id
-    address = (msg.text or "").strip()
-    user_states.setdefault(chat_id, {})["address"] = address
-    s = bot.send_message(chat_id, "კომენტარი. 📩")
-    bot.register_next_step_handler(s, ask_agent)
-
-def ask_agent(msg):
-    chat_id = msg.chat.id
-    comment = (msg.text or "").strip()
-    user_states.setdefault(chat_id, {})["comment"] = comment
-    s = bot.send_message(chat_id, "აგენტის სახელი და გვარი. 👩‍💻")
-    bot.register_next_step_handler(s, finish_and_store)
-
-def finish_and_store(msg):
-    chat_id = msg.chat.id
-    agent = (msg.text or "").strip()
-    state = user_states.get(chat_id, {})
-    state["agent"] = agent
-
-    hotel = state.get("hotel_name", "").strip()
-    address = state.get("address", "").strip()
-    comment = state.get("comment", "").strip()
-    agent_name = state.get("agent", "").strip()
-    user_full = f"{msg.from_user.first_name or ''} {msg.from_user.last_name or ''}".strip()
-
-    if not hotel:
-        s = bot.send_message(chat_id, "კორპორაციის სახელი არ არის მითითებული. გთხოვთ ჩაწეროთ კორპორაციის დასახელება:")
-        bot.register_next_step_handler(s, ask_address)
-        return
-
-    ok = save_to_sheet(hotel, address, comment, agent_name, user_full)
-    if ok:
-        bot.send_message(chat_id, "OK TV გისურვებთ წარმატებულ დღეს. 🥰", reply_markup=types.ReplyKeyboardRemove())
-    else:
-        bot.send_message(chat_id, "შეცდომა მონაცემების შენახვისას. გთხოვთ მიმართოთ ადმინისტრატორს.", reply_markup=types.ReplyKeyboardRemove())
-
-    user_states.pop(chat_id, None)
-
-# ---------- Webhook and Flask endpoints ----------
-@app.route("/", methods=["GET"])
-def index():
-    return "HotelClaimBot running."
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+# ---------------- Webhook handler ----------------
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def webhook():
-    try:
-        update = request.get_json(force=True)
-        if update:
-            bot.process_new_updates([telebot.types.Update.de_json(update)])
-    except Exception as e:
-        logger.exception(f"Webhook processing failed: {e}")
+    update = request.get_json(force=True)
+    if 'message' not in update:
+        return jsonify({"ok": True})
+
+    msg = update['message']
+    chat_id = msg['chat']['id']
+    text = msg.get('text', '').strip()
+    if not text:
+        return jsonify({"ok": True})
+
+    # Command to view DB
+    if text.strip().lower() in ('/myhotels', 'myhotels'):
+        rows = get_all_hotels()
+        if not rows:
+            send_message(chat_id, "ჩანაწერები არ მოიძებნა.", reply_markup=keyboard_main())
+        else:
+            out = "<b>ჩაწერილი კორპორაციები / სასტუმროები:</b>\n"
+            for r in rows:
+                hid, name, address, comment, agent, ts = r
+                dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                out += f"\n🏷️ <b>{name}</b>\n📍 {address or '-'}\n📝 {comment or '-'}\n👤 {agent or '-'}\n⏱ {dt}\n"
+            send_message(chat_id, out, reply_markup=keyboard_main())
+        return jsonify({"ok": True})
+
+    # Start flows
+    # If user pressed search:
+    if text in ("მოძებნე. 🔍", "მოძებნე", "მოძებნე 🔍"):
+        set_pending(chat_id, "awaiting_search_name")
+        send_message(chat_id, "გთხოვ, ჩაწერეთ სასტუმროს/კორპორაციის სახელი საძიებლად.", reply_markup=keyboard_search_only())
+        return jsonify({"ok": True})
+
+    # If user presses start button to begin registration
+    if text in ("დაწყება / start. 🚀", "start", "/start"):
+        # If the user had previously searched and we have temp_name, begin from that; otherwise ask for name.
+        state, temp_name, temp_address, temp_comment = get_pending(chat_id)
+        if temp_name:
+            set_pending(chat_id, "awaiting_name", temp_name=temp_name)
+            send_message(chat_id, "დავიწყოთ რეგისტრაცია. პირველი, გთხოვთ დაადასტურეთ ან ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
+        else:
+            set_pending(chat_id, "awaiting_name")
+            send_message(chat_id, "დავიწყოთ რეგისტრაცია. გთხოვთ ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # handle pending states
+    state, temp_name, temp_address, temp_comment = get_pending(chat_id)
+
+    # Search state: user types name to check
+    if state == "awaiting_search_name":
+        search_name = text
+        existing = hotel_exists_by_name(search_name)
+        if existing:
+            send_message(chat_id, "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+        else:
+            # not exists
+            set_pending(chat_id, "ready_to_register", temp_name=search_name)
+            send_message(chat_id, "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️\n\nთუ გსურთ, შეყვანა (რეგისტრაცია) ჩააბათ მაშინ დააჭირეთ ღილაკს \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
+            return jsonify({"ok": True})
+
+    # awaiting_name - from start flow
+    if state == "awaiting_name":
+        # Accept name (either typed or confirm temp_name)
+        name_val = text
+        # store and move to address
+        set_pending(chat_id, "awaiting_address", temp_name=name_val)
+        send_message(chat_id, "კორპორაციის დასახელება მიღებულია. გთხოვთ ჩაწერეთ — <b>მისამართი. 📍</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_address
+    if state == "awaiting_address":
+        address = text
+        set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=address)
+        send_message(chat_id, "მისამართი მიღებულია. გთხოვთ ჩაწერეთ — <b>კომენტარი. 📩</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_comment
+    if state == "awaiting_comment":
+        comment = text
+        set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_comment=comment)
+        send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწერეთ — <b>აგენტის სახელი და გვარი. 👩‍💻</b>", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    # awaiting_agent
+    if state == "awaiting_agent":
+        agent = text
+        if not temp_name:
+            send_message(chat_id, "ხარვეზი: სახელი არ მოიძებნა. გთხოვთ დაიწყოთ თავიდან ღილაკით \"მოძებნე. 🔍\" ან დააჭირეთ \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+        # Save to DB
+        add_hotel(temp_name, temp_address or "", temp_comment or "", agent or "")
+        clear_pending(chat_id)
+        send_message(chat_id, "OK TV გისურვებთ წარმატებულ დღეს. 🥰", reply_markup=keyboard_main())
+        return jsonify({"ok": True})
+
+    # No known flow: nudge user to search
+    send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით \"მოძებნე. 🔍\" საწყისისთვის ან გამოიყენეთ /myhotels რათა ნახოთ ჩანაწერები.", reply_markup=keyboard_main())
     return jsonify({"ok": True})
 
-def set_webhook():
-    if not WEBHOOK_URL:
-        logger.info("WEBHOOK_URL is not set; skipping webhook registration.")
-        return
-    try:
-        bot.remove_webhook()
-        bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook set to {WEBHOOK_URL}")
-    except Exception as e:
-        logger.exception(f"Failed to set webhook: {e}")
+# index
+@app.route('/')
+def index():
+    return "HotelClaimBot is running."
 
-if __name__ == "__main__":
-    set_webhook()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# set webhook on start (optional; will try)
+if _name_ == '_main_':
+    webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    try:
+        r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
+        print("Webhook set response:", r.text)
+    except Exception as e:
+        print("Failed to set webhook automatically:", e)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
