@@ -16,6 +16,7 @@ if google_creds_json:
 else:
     sheet = None
     print("⚠️ Google Sheets ავტორიზაცია ვერ შესრულდა.")
+
 # telegram_hotel_claim_bot.py
 # -- coding: utf-8 --
 """
@@ -37,7 +38,6 @@ Command:
 /myhotels - list saved records
 """
 
-import os
 import sqlite3
 import time
 import requests
@@ -50,9 +50,9 @@ if not BOT_TOKEN:
     raise RuntimeError("Please set BOT_TOKEN environment variable")
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DB_PATH = "data.db"
+DB_PATH = os.path.join(os.getcwd(), "data.db")
 
-app = Flask(_name_)
+app = Flask(__name__)
 
 # ---------------- Database helpers ----------------
 def init_db():
@@ -110,6 +110,19 @@ def add_hotel(name, address, comment, agent):
         (name.strip(), address.strip() if address else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
     )
 
+    # --- Optional Google Sheets სინქრონიზაცია ---
+    if sheet:
+        try:
+            sheet.append_row([
+                name,
+                address,
+                comment,
+                agent,
+                datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+            ])
+        except Exception as e:
+            print("⚠️ Google Sheets synchronization failed:", e)
+
 def get_all_hotels():
     return db_execute("SELECT id, name, address, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
 
@@ -153,7 +166,12 @@ def keyboard_start_only():
 # ---------------- Webhook handler ----------------
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def webhook():
-    update = request.get_json(force=True)
+    try:
+        update = request.get_json(force=True)
+    except Exception as e:
+        print("Invalid update received:", e)
+        return jsonify({"ok": True})
+
     if 'message' not in update:
         return jsonify({"ok": True})
 
@@ -178,15 +196,12 @@ def webhook():
         return jsonify({"ok": True})
 
     # Start flows
-    # If user pressed search:
     if text in ("მოძებნე. 🔍", "მოძებნე", "მოძებნე 🔍"):
         set_pending(chat_id, "awaiting_search_name")
         send_message(chat_id, "გთხოვ, ჩაწერეთ სასტუმროს/კორპორაციის სახელი საძიებლად.", reply_markup=keyboard_search_only())
         return jsonify({"ok": True})
 
-    # If user presses start button to begin registration
     if text in ("დაწყება / start. 🚀", "start", "/start"):
-        # If the user had previously searched and we have temp_name, begin from that; otherwise ask for name.
         state, temp_name, temp_address, temp_comment = get_pending(chat_id)
         if temp_name:
             set_pending(chat_id, "awaiting_name", temp_name=temp_name)
@@ -196,71 +211,61 @@ def webhook():
             send_message(chat_id, "დავიწყოთ რეგისტრაცია. გთხოვთ ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
-    # handle pending states
     state, temp_name, temp_address, temp_comment = get_pending(chat_id)
 
-    # Search state: user types name to check
     if state == "awaiting_search_name":
         search_name = text
         existing = hotel_exists_by_name(search_name)
         if existing:
             send_message(chat_id, "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=keyboard_main())
             clear_pending(chat_id)
-            return jsonify({"ok": True})
         else:
-            # not exists
             set_pending(chat_id, "ready_to_register", temp_name=search_name)
             send_message(chat_id, "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️\n\nთუ გსურთ, შეყვანა (რეგისტრაცია) ჩააბათ მაშინ დააჭირეთ ღილაკს \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
-            return jsonify({"ok": True})
+        return jsonify({"ok": True})
 
-    # awaiting_name - from start flow
     if state == "awaiting_name":
-        # Accept name (either typed or confirm temp_name)
         name_val = text
-        # store and move to address
         set_pending(chat_id, "awaiting_address", temp_name=name_val)
         send_message(chat_id, "კორპორაციის დასახელება მიღებულია. გთხოვთ ჩაწერეთ — <b>მისამართი. 📍</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
-    # awaiting_address
     if state == "awaiting_address":
         address = text
         set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=address)
         send_message(chat_id, "მისამართი მიღებულია. გთხოვთ ჩაწერეთ — <b>კომენტარი. 📩</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
-    # awaiting_comment
     if state == "awaiting_comment":
         comment = text
         set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_comment=comment)
         send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწერეთ — <b>აგენტის სახელი და გვარი. 👩‍💻</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
-    # awaiting_agent
     if state == "awaiting_agent":
         agent = text
         if not temp_name:
             send_message(chat_id, "ხარვეზი: სახელი არ მოიძებნა. გთხოვთ დაიწყოთ თავიდან ღილაკით \"მოძებნე. 🔍\" ან დააჭირეთ \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
             clear_pending(chat_id)
             return jsonify({"ok": True})
-        # Save to DB
+
         add_hotel(temp_name, temp_address or "", temp_comment or "", agent or "")
         clear_pending(chat_id)
         send_message(chat_id, "OK TV გისურვებთ წარმატებულ დღეს. 🥰", reply_markup=keyboard_main())
         return jsonify({"ok": True})
 
-    # No known flow: nudge user to search
     send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით \"მოძებნე. 🔍\" საწყისისთვის ან გამოიყენეთ /myhotels რათა ნახოთ ჩანაწერები.", reply_markup=keyboard_main())
     return jsonify({"ok": True})
 
-# index
+# ---------------- INDEX ----------------
 @app.route('/')
 def index():
     return "HotelClaimBot is running."
 
-# set webhook on start (optional; will try)
+# ---------------- MAIN ----------------
 if __name__ == '__main__':
     webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    print(f"Setting webhook to: {webhook_url}")
     try:
         r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
         print("Webhook set response:", r.text)
