@@ -1,6 +1,7 @@
 services:
-  - type: worker
-    name: hotelclaimbot
+  - type: web
+    name: ok-tv-1
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python telegram_hotel_booking_bot.py"
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_hotel_booking_bot.py
