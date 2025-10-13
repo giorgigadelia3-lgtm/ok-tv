@@ -259,7 +259,7 @@ def index():
     return "HotelClaimBot is running."
 
 # set webhook on start (optional; will try)
-if _name_ == '_main_':
+if __name__ == '__main__':
     webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
     try:
         r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
