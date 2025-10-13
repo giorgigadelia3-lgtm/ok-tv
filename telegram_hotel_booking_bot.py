@@ -1,48 +1,16 @@
+# telegram_hotel_booking_bot.py
+# -*- coding: utf-8 -*-
 import os
 import json
-import gspread
-from google.oauth2.service_account import Credentials
-
-# --- Google Sheets ავტორიზაცია ---
-google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if google_creds_json:
-    creds_dict = json.loads(google_creds_json)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    client = gspread.authorize(creds)
-
-    # ჩაანაცვლე შენი ცხრილის ID-ით (ნახავ URL-ში: https://docs.google.com/spreadsheets/d/🟩_აქაა_ID_🟩/edit)
-    SPREADSHEET_ID = "აქ ჩასვი შენი Google Sheet ID"
-    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-else:
-    sheet = None
-    print("⚠️ Google Sheets ავტორიზაცია ვერ შესრულდა.")
-
-# telegram_hotel_claim_bot.py
-# -- coding: utf-8 --
-"""
-HotelClaimBot — Telegram webhook-based bot for searching and registering hotel/corporation offers.
-
-Flow:
-- User presses "მოძებნე. 🔍"
-- Bot asks for name to search
-  - if exists -> "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️" (end)
-  - if not exists -> "კორპორაცია თავისუფალია, გისურვებთ წარმატებებს. ✅️" + show Start button
-- If user presses Start -> registration flow:
-  1) "კორპორაციის დასახელება. 🏢"
-  2) "მისამართი. 📍"
-  3) "კომენტარი. 📩"
-  4) "აგენტის სახელი და გვარი. 👩‍💻"
-  -> Save to SQLite and reply "OK TV გისურვებთ წარმატებულ დღეს. 🥰"
-
-Command:
-/myhotels - list saved records
-"""
-
 import sqlite3
 import time
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
+
+# Google sheets libraries
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -51,6 +19,40 @@ if not BOT_TOKEN:
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DB_PATH = os.path.join(os.getcwd(), "data.db")
+
+# Google Sheets envs
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")  # required to sync
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")  # full json string
+
+# ---------------- Google Sheets connection ----------------
+sheet = None
+if GOOGLE_CREDS_JSON and SPREADSHEET_ID:
+    try:
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+
+        # Ensure header row exists (if sheet empty)
+        try:
+            values = sheet.row_values(1)
+            if not values or len(values) < 5:
+                header = ["hotel name", "address", "comment", "agent", "date"]
+                sheet.insert_row(header, index=1)
+        except Exception as e:
+            # non-fatal
+            print("Warning: couldn't ensure header row in sheet:", e)
+
+        print("✅ Google Sheets connected.")
+    except Exception as e:
+        sheet = None
+        print("⚠️ Google Sheets auth failed:", e)
+else:
+    print("⚠️ Google Sheets environment not fully configured (SPREADSHEET_ID or creds missing).")
 
 app = Flask(__name__)
 
@@ -81,6 +83,7 @@ def init_db():
     conn.close()
 
 def db_execute(query, params=(), fetch=False):
+    # Open a fresh connection per-call (safer for webworkers)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(query, params)
@@ -95,12 +98,22 @@ init_db()
 
 # ---------------- Utilities ----------------
 def normalize(s: str) -> str:
-    return " ".join(s.strip().lower().split()) if s else ""
+    # collapse whitespace, lowercase, strip
+    if not s:
+        return ""
+    return " ".join(s.strip().lower().split())
 
 # ---------------- Business logic ----------------
 def hotel_exists_by_name(name: str):
+    """
+    Check if hotel name exists in local DB (case-insensitive, whitespace-normalized).
+    Returns the first matching row (id, name, address) or None.
+    """
     n = normalize(name)
-    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(name)=?", (n,), fetch=True)
+    if not n:
+        return None
+    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(TRIM(REPLACE(name, '\n', ' '))) = ?", (n,), fetch=True)
+    # Note: using a normalized param; DB stores original name but comparison is lower-trim on DB side
     return rows[0] if rows else None
 
 def add_hotel(name, address, comment, agent):
@@ -110,18 +123,19 @@ def add_hotel(name, address, comment, agent):
         (name.strip(), address.strip() if address else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
     )
 
-    # --- Optional Google Sheets სინქრონიზაცია ---
+    # --- Optional Google Sheets synchronization ---
     if sheet:
         try:
+            # append_row has optional params, specify user entered
             sheet.append_row([
-                name,
-                address,
-                comment,
-                agent,
+                name.strip(),
+                address.strip() if address else "",
+                comment.strip() if comment else "",
+                agent.strip() if agent else "",
                 datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
-            ])
+            ], value_input_option='USER_ENTERED')
         except Exception as e:
-            print("⚠️ Google Sheets synchronization failed:", e)
+            print("⚠️ Failed to sync with Google Sheets:", e)
 
 def get_all_hotels():
     return db_execute("SELECT id, name, address, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
@@ -249,6 +263,12 @@ def webhook():
             clear_pending(chat_id)
             return jsonify({"ok": True})
 
+        # Final duplicate safety-check BEFORE saving (race-condition prevention)
+        if hotel_exists_by_name(temp_name):
+            send_message(chat_id, "კორპორაციისთვის შეთავაზება მიწოდებულია. ❌️", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+
         add_hotel(temp_name, temp_address or "", temp_comment or "", agent or "")
         clear_pending(chat_id)
         send_message(chat_id, "OK TV გისურვებთ წარმატებულ დღეს. 🥰", reply_markup=keyboard_main())
@@ -264,7 +284,9 @@ def index():
 
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
-    webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    # Build webhook url
+    webhook_host = os.environ.get("WEBHOOK_HOST", "https://ok-tv-1.onrender.com")
+    webhook_url = f"{webhook_host.rstrip('/')}/{BOT_TOKEN}"
     print(f"Setting webhook to: {webhook_url}")
     try:
         r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
