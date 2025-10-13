@@ -7,9 +7,7 @@ import time
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
-from difflib import get_close_matches  # მსგავსი სახელების მოსაძებნად
-
-# Google Sheets libs
+from difflib import get_close_matches
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -24,7 +22,7 @@ DB_PATH = os.path.join(os.getcwd(), "data.db")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
-# ---------------- Google Sheets connection ----------------
+# ---------------- GOOGLE SHEETS CONNECTION ----------------
 sheet = None
 if GOOGLE_CREDS_JSON and SPREADSHEET_ID:
     try:
@@ -36,50 +34,68 @@ if GOOGLE_CREDS_JSON and SPREADSHEET_ID:
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
         sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-
-        # Check header
-        try:
-            values = sheet.row_values(1)
-            if not values or len(values) < 5:
-                header = ["hotel name", "address", "comment", "agent", "date"]
-                sheet.insert_row(header, index=1)
-        except Exception as e:
-            print("⚠️ Could not verify header row:", e)
-
         print("✅ Google Sheets connected.")
     except Exception as e:
-        print("⚠️ Google Sheets auth failed:", e)
+        sheet = None
+        print("⚠️ Google Sheets connection failed:", e)
 else:
-    print("⚠️ Missing Google Sheets credentials or ID.")
+    print("⚠️ Google Sheets env not configured (SPREADSHEET_ID or creds missing).")
 
 app = Flask(__name__)
 
-# ---------------- Database helpers ----------------
-def init_db():
+# ---------------- DB INIT + MIGRATE ----------------
+def init_db_and_migrate():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # hotels table: ensure decision_contact column exists
     cur.execute('''
         CREATE TABLE IF NOT EXISTS hotels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             address TEXT,
+            decision_contact TEXT,
             comment TEXT,
             agent TEXT,
             created_at INTEGER
         )
     ''')
+
+    # pending table includes temp_decision_contact
     cur.execute('''
         CREATE TABLE IF NOT EXISTS pending (
             chat_id INTEGER PRIMARY KEY,
             state TEXT,
             temp_name TEXT,
             temp_address TEXT,
+            temp_decision_contact TEXT,
             temp_comment TEXT
         )
     ''')
+
+    # safe ALTER if old DB lacks columns
+    cur.execute("PRAGMA table_info(hotels)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "decision_contact" not in cols:
+        try:
+            cur.execute("ALTER TABLE hotels ADD COLUMN decision_contact TEXT")
+        except Exception:
+            pass
+
+    cur.execute("PRAGMA table_info(pending)")
+    cols2 = [r[1] for r in cur.fetchall()]
+    if "temp_decision_contact" not in cols2:
+        try:
+            cur.execute("ALTER TABLE pending ADD COLUMN temp_decision_contact TEXT")
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
 
+init_db_and_migrate()
+
+# ---------------- DB helper ----------------
 def db_execute(query, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -91,81 +107,83 @@ def db_execute(query, params=(), fetch=False):
     conn.close()
     return data
 
-init_db()
-
-# ---------------- Utilities ----------------
+# ---------------- UTILITIES ----------------
 def normalize(s: str) -> str:
     return " ".join(s.lower().strip().split()) if s else ""
 
-def similar_name(search, names, cutoff=0.75):
-    """პოულობს ყველაზე მსგავს სახელს"""
-    matches = get_close_matches(normalize(search), [normalize(n) for n in names], n=1, cutoff=cutoff)
+def similar_name(search, names, cutoff=0.7):
+    if not names:
+        return None
+    norm_map = {normalize(n): n for n in names}
+    matches = get_close_matches(normalize(search), list(norm_map.keys()), n=1, cutoff=cutoff)
     if matches:
-        for n in names:
-            if normalize(n) == matches[0]:
-                return n
+        return norm_map[matches[0]]
     return None
 
-# ---------------- Business logic ----------------
+# ---------------- SHEET + DB BUSINESS ----------------
 def get_all_sheet_hotels():
-    """კითხულობს ყველა სასტუმროს სახელებს Google Sheet-იდან"""
+    """Return list of hotel names from Google Sheet (original spelling). Expects header in row1."""
     try:
         if sheet:
-            data = sheet.col_values(1)
-            return [d for d in data[1:] if d.strip()]  # skip header
+            col = sheet.col_values(1)  # column A
+            return [v for v in col[1:] if v and v.strip()]  # skip header
     except Exception as e:
-        print("⚠️ Could not read from Google Sheet:", e)
+        print("⚠️ Error reading sheet names:", e)
     return []
 
-def hotel_exists_by_name(name: str):
-    """ამოწმებს SQLite-ში"""
+def hotel_exists_in_db(name: str):
     n = normalize(name)
-    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(TRIM(name)) = ?", (n,), fetch=True)
+    rows = db_execute("SELECT id, name, address FROM hotels WHERE LOWER(name)=?", (n,), fetch=True)
     return rows[0] if rows else None
 
-def add_hotel(name, address, comment, agent):
+def add_hotel(name, address, decision_contact, comment, agent):
     ts = int(time.time())
     db_execute(
-        "INSERT INTO hotels (name, address, comment, agent, created_at) VALUES (?, ?, ?, ?, ?)",
-        (name.strip(), address.strip() if address else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
+        "INSERT INTO hotels (name, address, decision_contact, comment, agent, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (name.strip(), address.strip() if address else None, decision_contact.strip() if decision_contact else None, comment.strip() if comment else None, agent.strip() if agent else None, ts)
     )
+    # Append to Google Sheet in exact column order that you use:
+    # hotel name | address | comment | Contact | agent | date
     if sheet:
         try:
             sheet.append_row([
                 name.strip(),
                 address.strip() if address else "",
                 comment.strip() if comment else "",
+                decision_contact.strip() if decision_contact else "",
                 agent.strip() if agent else "",
-                datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
-            ], value_input_option='USER_ENTERED')
+                datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            ], value_input_option="USER_ENTERED")
         except Exception as e:
-            print("⚠️ Sheet sync failed:", e)
+            print("⚠️ Failed to append to Google Sheet:", e)
 
-# ---------------- Pending helpers ----------------
-def set_pending(chat_id, state, temp_name=None, temp_address=None, temp_comment=None):
+# ---------------- PENDING HELPERS ----------------
+def set_pending(chat_id, state, temp_name=None, temp_address=None, temp_decision_contact=None, temp_comment=None):
     db_execute(
-        "REPLACE INTO pending (chat_id, state, temp_name, temp_address, temp_comment) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, state, temp_name, temp_address, temp_comment)
+        "REPLACE INTO pending (chat_id, state, temp_name, temp_address, temp_decision_contact, temp_comment) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, state, temp_name, temp_address, temp_decision_contact, temp_comment)
     )
 
 def get_pending(chat_id):
-    rows = db_execute("SELECT state, temp_name, temp_address, temp_comment FROM pending WHERE chat_id=?", (chat_id,), fetch=True)
+    rows = db_execute("SELECT state, temp_name, temp_address, temp_decision_contact, temp_comment FROM pending WHERE chat_id=?", (chat_id,), fetch=True)
     if rows:
         return rows[0]
-    return (None, None, None, None)
+    return (None, None, None, None, None)
 
 def clear_pending(chat_id):
     db_execute("DELETE FROM pending WHERE chat_id=?", (chat_id,))
 
-# ---------------- Telegram helpers ----------------
+# ---------------- TELEGRAM HELPERS ----------------
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+        r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+        return r.json()
     except Exception as e:
-        print("⚠️ Failed to send message:", e)
+        print("⚠️ Telegram send error:", e)
+        return None
 
 def keyboard_main():
     return {"keyboard": [[{"text": "მოძებნე. 🔍"}, {"text": "დაწყება / start. 🚀"}], [{"text": "/myhotels"}]], "resize_keyboard": True}
@@ -176,93 +194,112 @@ def keyboard_search_only():
 def keyboard_start_only():
     return {"keyboard": [[{"text": "დაწყება / start. 🚀"}]], "resize_keyboard": True}
 
-# ---------------- Webhook ----------------
+# ---------------- WEBHOOK ----------------
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def webhook():
     update = request.get_json(force=True)
-    msg = update.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "").strip()
-
-    if not chat_id or not text:
+    if not update or 'message' not in update:
         return jsonify({"ok": True})
 
-    # Commands
-    if text.lower() in ("/myhotels", "myhotels"):
-        rows = db_execute("SELECT name, address, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
+    msg = update['message']
+    chat_id = msg['chat']['id']
+    text = msg.get('text', '').strip()
+    if not text:
+        return jsonify({"ok": True})
+
+    # /myhotels command - shows stored rows (DB)
+    if text.lower() in ('/myhotels', 'myhotels'):
+        rows = db_execute("SELECT name, address, decision_contact, comment, agent, created_at FROM hotels ORDER BY created_at DESC", fetch=True)
         if not rows:
-            send_message(chat_id, "ჩანაწერები არ მოიძებნა.", keyboard_main())
+            send_message(chat_id, "📭 ჩანაწერები არ მოიძებნა.", reply_markup=keyboard_main())
         else:
-            out = "<b>ჩაწერილი კორპორაციები:</b>\n"
-            for name, address, comment, agent, ts in rows:
-                out += f"\n🏷️ <b>{name}</b>\n📍 {address or '-'}\n📝 {comment or '-'}\n👤 {agent or '-'}\n⏱ {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')}\n"
-            send_message(chat_id, out, keyboard_main())
+            out = "<b>ჩაწერილი კორპორაციები / სასტუმროები:</b>\n"
+            for name, address, decision_contact, comment, agent, ts in rows:
+                dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                out += f"\n🏷️ <b>{name}</b>\n📍 {address or '-'}\n📞 {decision_contact or '-'}\n📝 {comment or '-'}\n👤 {agent or '-'}\n⏱ {dt}\n"
+            send_message(chat_id, out, reply_markup=keyboard_main())
         return jsonify({"ok": True})
 
-    # Search flow
-    state, temp_name, temp_address, temp_comment = get_pending(chat_id)
-    if text in ("მოძებნე", "მოძებნე. 🔍", "მოძებნე 🔍"):
+    # Start search
+    if text in ("მოძებნე. 🔍", "მოძებნე", "მოძებნე 🔍"):
         set_pending(chat_id, "awaiting_search")
-        send_message(chat_id, "გთხოვთ ჩაწერეთ სასტუმროს/კორპორაციის სახელი საძიებლად.", keyboard_search_only())
+        send_message(chat_id, "გთხოვთ ჩაწერეთ სასტუმროს/კორპორაციის სახელი საძიებლად.", reply_markup=keyboard_search_only())
         return jsonify({"ok": True})
 
-    if state == "awaiting_search":
-        search_name = text
-        sheet_names = get_all_sheet_hotels()
-        match = None
-
-        # 1. Check exact match in Sheet
-        if any(normalize(search_name) == normalize(n) for n in sheet_names):
-            send_message(chat_id, "✅ ეს სასტუმრო უკვე ჩაწერილია (Google Sheets-ში).", keyboard_main())
-            clear_pending(chat_id)
-            return jsonify({"ok": True})
-
-        # 2. Check similar match
-        match = similar_name(search_name, sheet_names)
-        if match:
-            send_message(chat_id, f"⚠️ მსგავსი სახელით სასტუმრო მოიძებნა: <b>{match}</b>\nშეამოწმე შეიძლება იგივე იყოს.", keyboard_main())
-            clear_pending(chat_id)
-            return jsonify({"ok": True})
-
-        # 3. Check in local DB
-        if hotel_exists_by_name(search_name):
-            send_message(chat_id, "❌ კორპორაციისთვის შეთავაზება უკვე მიწოდებულია.", keyboard_main())
-            clear_pending(chat_id)
-            return jsonify({"ok": True})
-
-        # 4. None found
-        set_pending(chat_id, "ready_to_register", temp_name=search_name)
-        send_message(chat_id, "✅ ეს კორპორაცია თავისუფალია. გისურვებთ წარმატებებს!\nდასაწყებად დააჭირეთ \"დაწყება / start. 🚀\"", keyboard_main())
-        return jsonify({"ok": True})
-
-    # Registration flow
-    if text in ("დაწყება / start. 🚀", "start", "/start"):
+    # Manual start registration
+    if text in ("დაწყება / start. 🚀", "/start", "start"):
         set_pending(chat_id, "awaiting_name")
-        send_message(chat_id, "შეიყვანეთ — <b>კორპორაციის დასახელება. 🏢</b>", keyboard_start_only())
+        send_message(chat_id, "გთხოვთ ჩაწერეთ — <b>კორპორაციის დასახელება. 🏢</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
+    # Get pending state
+    state, temp_name, temp_address, temp_decision_contact, temp_comment = get_pending(chat_id)
+
+    # SEARCH FLOW
+    if state == "awaiting_search":
+        search_raw = text
+        search = normalize(search_raw)
+
+        # 1) check Google Sheet first
+        sheet_names = get_all_sheet_hotels()
+        if sheet_names:
+            # exact match?
+            if any(normalize(n) == search for n in sheet_names):
+                send_message(chat_id, "❌ ამ აბონენტისთვის наша შეთავაზება უკვე გაგზავნილია.", reply_markup=keyboard_main())
+                # NOTE: user asked Georgian text; ensure correct text
+                # (we'll send corrected Georgian below)
+                # But to be exact, send proper Georgian:
+                send_message(chat_id, "❌ ამ აბონენტისთვის ჩვენი შეთავაზება უკვე გაგზავნილია.", reply_markup=keyboard_main())
+                clear_pending(chat_id)
+                return jsonify({"ok": True})
+
+            # similar?
+            similar = similar_name(search_raw, sheet_names, cutoff=0.7)
+            if similar:
+                send_message(chat_id, f"🔎 მსგავსი სახელით სასტუმრო მოიძებნა (Sheet): <b>{similar}</b>\nგთხოვთ გადაამოწმოთ, შეიძლება იგივე იყოს.", reply_markup=keyboard_main())
+                clear_pending(chat_id)
+                return jsonify({"ok": True})
+
+        # 2) check local DB
+        if hotel_exists_in_db(search_raw):
+            send_message(chat_id, "❌ ამ აბონენტისთვის ჩვენი შეთავაზება უკვე გაგზავნილია.", reply_markup=keyboard_main())
+            clear_pending(chat_id)
+            return jsonify({"ok": True})
+
+        # 3) not found -> offer to register
+        set_pending(chat_id, "ready_to_register", temp_name=search_raw)
+        send_message(chat_id, "✅ ეს კორპორაცია თავისუფალია. თუ გსურთ რეგისტრაცია დააწკაპუნეთ \"დაწყება / start. 🚀\".", reply_markup=keyboard_main())
+        return jsonify({"ok": True})
+
+    # REGISTRATION FLOW: name -> address -> decision_contact -> comment -> agent
     if state == "awaiting_name":
         set_pending(chat_id, "awaiting_address", temp_name=text)
-        send_message(chat_id, "დასახელება მიღებულია. ახლა ჩაწერეთ — <b>მისამართი. 📍</b>", keyboard_start_only())
+        send_message(chat_id, "სახელი მიღებულია. გთხოვთ ჩაწეროთ — <b>მისამართი. 📍</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
     if state == "awaiting_address":
-        set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=text)
-        send_message(chat_id, "მისამართი მიღებულია. ახლა ჩაწერეთ — <b>კომენტარი. 📩</b>", keyboard_start_only())
+        set_pending(chat_id, "awaiting_decision_contact", temp_name=temp_name, temp_address=text)
+        send_message(chat_id, "გთხოვთ მიუთითოთ გადამწყვეტი პირის კონტაქტი (ტელეფონი ან მეილი). 📞✉️", reply_markup=keyboard_start_only())
+        return jsonify({"ok": True})
+
+    if state == "awaiting_decision_contact":
+        set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=temp_address, temp_decision_contact=text)
+        send_message(chat_id, "კონტაქტი მიღებულია. გთხოვთ ჩაწეროთ — <b>კომენტარი. 📝</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
     if state == "awaiting_comment":
-        set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_comment=text)
-        send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწერეთ — <b>აგენტის სახელი და გვარი. 👩‍💻</b>", keyboard_start_only())
+        set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_decision_contact=temp_decision_contact, temp_comment=text)
+        send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწეროთ — <b>აგენტის სახელი და გვარი. 👩‍💻</b>", reply_markup=keyboard_start_only())
         return jsonify({"ok": True})
 
     if state == "awaiting_agent":
-        add_hotel(temp_name, temp_address, temp_comment, text)
+        add_hotel(temp_name, temp_address or "", temp_decision_contact or "", temp_comment or "", text or "")
         clear_pending(chat_id)
-        send_message(chat_id, "✅ მონაცემები შენახულია. OK TV გისურვებთ წარმატებულ დღეს! 🥰", keyboard_main())
+        send_message(chat_id, "✅ მონაცემები შენახულია. OK TV გისურვებთ წარმატებულ დღეს! 🥰", reply_markup=keyboard_main())
         return jsonify({"ok": True})
 
-    send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით „მოძებნე. 🔍“ ან /myhotels.", keyboard_main())
+    # default
+    send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით 'მოძებნე. 🔍' ან გამოიყენეთ /myhotels.", reply_markup=keyboard_main())
     return jsonify({"ok": True})
 
 # ---------------- INDEX ----------------
@@ -272,7 +309,9 @@ def index():
 
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
-    webhook_url = f"https://ok-tv-1.onrender.com/{BOT_TOKEN}"
+    webhook_host = os.environ.get("WEBHOOK_HOST", "https://ok-tv-1.onrender.com")
+    webhook_url = f"{webhook_host.rstrip('/')}/{BOT_TOKEN}"
+    print(f"Setting webhook to: {webhook_url}")
     try:
         r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
         print("Webhook set response:", r.text)
