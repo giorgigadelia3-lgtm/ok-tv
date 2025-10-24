@@ -1,440 +1,369 @@
-# telegram_hotel_booking_bot.py
-# -*- coding: utf-8 -*-
-"""
-HotelClaimBot - production-ready:
-- SQLite: WAL, check_same_thread=False, timeout, retry
-- Google Sheets: connection, header mapping, caching, safe append
-- Search: exact address priority, fuzzy matching (SequenceMatcher)
-- Flow: search (name->address) + registration (name->address->decision contact->comment->agent)
-- Duplicate prevention (exact + fuzzy threshold)
-- Georgian messages
-"""
-
 import os
 import json
-import sqlite3
 import time
-import threading
-import requests
-from datetime import datetime
-from flask import Flask, request, jsonify
-from difflib import SequenceMatcher
-import logging
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple
 
-# Google Sheets
+from flask import Flask, request
+import telebot
+from telebot import types
+
+# === Google Sheets ===
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ---------------- CONFIG ----------------
-logging.basicConfig(level=logging.INFO)
-DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+# === Fuzzy matching ===
+from rapidfuzz import fuzz, process
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Please set BOT_TOKEN environment variable")
+# ---------------------------
+# ENVIRONMENT / CONFIG
+# ---------------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DB_PATH = os.path.join(os.getcwd(), "data.db")
+# Service Account JSON მთელი ტექსტით env-ში:
+#   GOOGLE_SERVICE_ACCOUNT_JSON = {...}
+GSERVICE_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+SHEET_KEY = os.environ["GSPREAD_SHEET_KEY"]  # Spreadsheet ID
+HOTELS_WS = os.getenv("HOTELS_WORKSHEET", "Hotels")  # worksheet name hotels list
+RESPONSES_WS = os.getenv("RESPONSES_WORKSHEET", "Responses")
 
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+# Column names (header row-ს მიხედვით). შეცვლადი env-ებით.
+COL_NAME_EN = os.getenv("HOTELS_NAME_COLUMN", "name_en")
+COL_ADDR_GE = os.getenv("HOTELS_ADDRESS_COLUMN", "address_ge")
+COL_STATUS = os.getenv("HOTELS_STATUS_COLUMN", "status")   # 'X', '✅' etc. = surveyed
+COL_COMMENT = os.getenv("HOTELS_COMMENT_COLUMN", "comment")
 
-SHEET_CACHE_TTL = int(os.environ.get("SHEET_CACHE_TTL", "60"))  # seconds
-# fuzzy thresholds
-FUZZY_STRONG = float(os.environ.get("FUZZY_STRONG", "0.88"))
-FUZZY_MEDIUM = float(os.environ.get("FUZZY_MEDIUM", "0.58"))
+# Matching thresholds
+EXACT_THRESHOLD = int(os.getenv("MATCH_EXACT_THRESHOLD", "90"))
+SUGGEST_THRESHOLD = int(os.getenv("MATCH_SUGGEST_THRESHOLD", "70"))
 
+# ---------------------------
+# BOT / WEB
+# ---------------------------
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# ---------------- Google Sheets connection + cache ----------------
-sheet = None
-_sheet_lock = threading.Lock()
-_sheet_cache = {"ts": None, "rows": []}
+# ---------------------------
+# STATE
+# ---------------------------
+@dataclass
+class PendingHotel:
+    name_en: Optional[str] = None
+    addr_ge: Optional[str] = None
+    candidate_from_sheet: Optional[Dict[str, Any]] = None  # top suggestion (if any)
+    found_status: Optional[str] = None  # "surveyed" | "unsurveyed" | "not_found"
 
-def connect_sheet():
-    global sheet
-    if not GOOGLE_CREDS_JSON or not SPREADSHEET_ID:
-        logging.info("Google Sheets not configured (SPREADSHEET_ID or GOOGLE_APPLICATION_CREDENTIALS_JSON missing).")
-        sheet = None
+@dataclass
+class SurveyState:
+    step: str = "IDLE"
+    pending: PendingHotel = field(default_factory=PendingHotel)
+    answers: Dict[str, Any] = field(default_factory=dict)
+    current_q_idx: int = 0
+
+user_state: Dict[int, SurveyState] = {}  # chat_id -> state
+
+
+# ---------------------------
+# GOOGLE SHEETS HELPERS
+# ---------------------------
+def gsheet_client():
+    info = json.loads(GSERVICE_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def get_hotels_records() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Return (records, header_index_map)."""
+    gc = gsheet_client()
+    ws = gc.open_by_key(SHEET_KEY).worksheet(HOTELS_WS)
+    rows = ws.get_all_records()  # list[dict] using header row
+    # map lower headers
+    headers = {k.strip().lower(): k for k in rows[0].keys()} if rows else {}
+    # but safer: grab header row directly
+    header_row = ws.row_values(1)
+    header_idx = {h.strip().lower(): i for i, h in enumerate(header_row)}
+    return rows, header_idx
+
+def ensure_responses_header():
+    gc = gsheet_client()
+    sh = gc.open_by_key(SHEET_KEY)
+    try:
+        ws = sh.worksheet(RESPONSES_WS)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=RESPONSES_WS, rows=2000, cols=50)
+        ws.append_row([
+            "timestamp", "name_en", "address_ge",
+            "matched_name_en", "matched_address_ge", "matched_status",
+            # dynamic Q headers appended later
+        ])
+    return ws
+
+def append_response_row(state: SurveyState):
+    ws = ensure_responses_header()
+    # ensure headers contain question keys (add if missing)
+    headers = ws.row_values(1)
+    q_keys = [k for k, _ in QUESTIONS]
+    missing = [k for k in q_keys if k not in headers]
+    if missing:
+        ws.add_cols(len(missing))
+        headers += missing
+        ws.update('A1', [headers])
+
+    row = [
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        state.pending.name_en or "",
+        state.pending.addr_ge or "",
+        (state.pending.candidate_from_sheet or {}).get(COL_NAME_EN, ""),
+        (state.pending.candidate_from_sheet or {}).get(COL_ADDR_GE, ""),
+        state.pending.found_status or "",
+    ]
+    # pad to current headers length, then fill answers in correct columns
+    values = {**{k: "" for k in headers}}
+    # base columns:
+    values["timestamp"] = row[0]
+    values["name_en"] = row[1]
+    values["address_ge"] = row[2]
+    values["matched_name_en"] = row[3]
+    values["matched_address_ge"] = row[4]
+    values["matched_status"] = row[5]
+    # answers:
+    for k in state.answers:
+        values[k] = state.answers[k]
+
+    ws.append_row([values.get(h, "") for h in headers], value_input_option="USER_ENTERED")
+
+def normalize(s: str) -> str:
+    return "".join(ch for ch in s.lower().strip() if ch.isalnum() or ch.isspace())
+
+def match_hotels(name_en: str, addr_ge: str):
+    """Return best match info: (found_status, best_row_or_None, best_score, suggestions)"""
+    records, _ = get_hotels_records()
+    if not records:
+        return "not_found", None, 0, []
+
+    cand_scores = []
+    for row in records:
+        r_name = str(row.get(COL_NAME_EN, "") or "")
+        r_addr = str(row.get(COL_ADDR_GE, "") or "")
+        name_score = fuzz.WRatio(normalize(name_en), normalize(r_name))
+        addr_score = fuzz.WRatio(normalize(addr_ge), normalize(r_addr)) if addr_ge else 0
+        # weighted combo: name 70%, address 30%
+        combo = int(0.7 * name_score + 0.3 * addr_score)
+        cand_scores.append((combo, name_score, addr_score, row))
+
+    cand_scores.sort(reverse=True, key=lambda x: x[0])
+    best = cand_scores[0]
+    suggestions = [c for c in cand_scores[:5] if c[0] >= SUGGEST_THRESHOLD]
+
+    best_combo, best_name, best_addr, best_row = best
+    status_cell = str(best_row.get(COL_STATUS, "") or "").strip().lower()
+    is_surveyed = status_cell in ("x", "✅", "yes", "true", "done", "surveyed")
+
+    if best_combo >= EXACT_THRESHOLD:
+        return ("surveyed" if is_surveyed else "unsurveyed"), best_row, best_combo, suggestions
+    else:
+        # no strong match
+        if suggestions:
+            # still present "similar" list for human check
+            return ("surveyed" if is_surveyed and best_combo >= SUGGEST_THRESHOLD else "not_found"), best_row, best_combo, suggestions
+        return "not_found", None, 0, []
+
+
+# ---------------------------
+# QUESTIONS (შენი არსებული ბლოკის ადგილი)
+# სურვილისამებრ ჩაანაცვლე/დაამატე
+# ---------------------------
+QUESTIONS: List[Tuple[str, str]] = [
+    ("contact_person", "კონტაქტის სახელი და გვარი?"),
+    ("phone", "ტელეფონის ნომერი?"),
+    ("rooms_count", "რამდენი ნომერია სასტუმროში?"),
+    ("email", "ელფოსტა?"),
+    ("notes", "დამატებითი კომენტარი?"),
+]
+# თუ გინდა მთლიანად შენი ბლოკი — უბრალოდ შეცვალე QUESTIONS.
+
+# ---------------------------
+# KEYBOARDS
+# ---------------------------
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("🔎 მოძებნა"), types.KeyboardButton("🧾 Start"))
+    return kb
+
+def start_only_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row(types.KeyboardButton("🧾 Start"), types.KeyboardButton("↩️ დაბრუნება მენიუში"))
+    return kb
+
+# ---------------------------
+# BOT HANDLERS
+# ---------------------------
+@bot.message_handler(commands=["start"])
+def on_start(msg: types.Message):
+    st = user_state.setdefault(msg.chat.id, SurveyState())
+    st.step = "IDLE"
+    st.pending = PendingHotel()
+    st.answers = {}
+    st.current_q_idx = 0
+    bot.send_message(
+        msg.chat.id,
+        "გამარჯობა! აირჩიე ქმედება 👇",
+        reply_markup=main_menu()
+    )
+
+@bot.message_handler(func=lambda m: m.text == "🔎 მოძებნა")
+def on_search_button(msg: types.Message):
+    st = user_state.setdefault(msg.chat.id, SurveyState())
+    st.step = "ASK_NAME_EN"
+    st.pending = PendingHotel()
+    bot.send_message(
+        msg.chat.id,
+        "გთხოვ, შეიყვანე <b>სასტუმროს ოფიციალური სახელი (ინგლისურად)</b>."
+    )
+
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "ASK_NAME_EN")
+def ask_address(msg: types.Message):
+    st = user_state[msg.chat.id]
+    st.pending.name_en = msg.text.strip()
+    st.step = "ASK_ADDR_GE"
+    bot.send_message(
+        msg.chat.id,
+        "ახლა შეიყვანე <b>სასტუმროს ოფიციალური მისამართი (ქართულად)</b>."
+    )
+
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "ASK_ADDR_GE")
+def perform_lookup(msg: types.Message):
+    st = user_state[msg.chat.id]
+    st.pending.addr_ge = msg.text.strip()
+
+    name_en = st.pending.name_en or ""
+    addr_ge = st.pending.addr_ge or ""
+
+    bot.send_message(msg.chat.id, "ძებნა მიმდინარეობს… ერთი წამი 🔎")
+    status, best_row, score, suggestions = match_hotels(name_en, addr_ge)
+    st.pending.candidate_from_sheet = best_row
+    st.pending.found_status = status
+
+    if status == "surveyed":
+        comment = ""
+        if best_row and COL_COMMENT in best_row and best_row[COL_COMMENT]:
+            comment = f"\nკომენტარი: <i>{best_row[COL_COMMENT]}</i>"
+        pretty = f"ნაპოვნია: <b>{best_row.get(COL_NAME_EN,'')}</b>\nმისამართი: {best_row.get(COL_ADDR_GE,'')}\nსტატუსი: ❌ უკვე გამოკითხულია.{comment}"
+        bot.send_message(msg.chat.id, pretty, reply_markup=main_menu())
+        # დასრულება
+        st.step = "IDLE"
         return
-    try:
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-        logging.info("✅ Google Sheets connected.")
-    except Exception as e:
-        sheet = None
-        logging.exception("⚠️ Google Sheets connection failed:")
 
-connect_sheet()
+    if status in ("unsurveyed", "not_found"):
+        text = []
+        if status == "unsurveyed":
+            text.append("ნაპოვნია მსგავსი სასტუმრო, მაგრამ <b>არ არის გამოკითხული</b> (შიტში არ აქვს 'X').")
+        else:
+            text.append("ასეთი სასტუმრო შიტში <b>დე ფაქტო ვერ ვიპოვე</b>.")
 
-def normalize_header(h: str) -> str:
-    if not h:
-        return ""
-    k = h.strip().lower()
-    if "hotel" in k and ("name" in k or "სახ" in k):
-        return "name"
-    if "address" in k or "მისამ" in k:
-        return "address"
-    if "comment" in k or "კომენტ" in k:
-        return "comment"
-    if "contact" in k or "კონტაქტ" in k:
-        return "contact"
-    if "agent" in k or "აგენტ" in k:
-        return "agent"
-    if "date" in k or "time" in k:
-        return "date"
-    return k
+        if suggestions:
+            text.append("\nახლოს მყოფი ვარიანტები:")
+            for i, (combo, nsc, asc, row) in enumerate(suggestions, start=1):
+                status_cell = str(row.get(COL_STATUS, "") or "").strip()
+                mark = "❌" if status_cell.lower() in ("x", "✅", "yes", "true", "done", "surveyed") else "🟢"
+                text.append(f"{i}) {row.get(COL_NAME_EN,'')} — {row.get(COL_ADDR_GE,'')}  [{mark}] ({combo}%)")
+            text.append("\nთუ ზემოთ მოცემული უკვე '❌' აღნიშვნითაა — გამოკითხულია და დასრულებულია.\n"
+                        "თუ არა — შეგიძლია დააჭირო <b>Start</b> და გააგრძელო შევსება.")
 
-def read_sheet_cached(force=False):
-    """Read all rows from sheet with TTL cache."""
-    global _sheet_cache
-    if not sheet:
-        return []
-    now = time.time()
-    if not force and _sheet_cache["ts"] and (now - _sheet_cache["ts"] < SHEET_CACHE_TTL):
-        if DEBUG_MODE:
-            logging.info("Using sheet cache")
-        return _sheet_cache["rows"]
-    with _sheet_lock:
-        try:
-            raw = sheet.get_all_values()
-            if not raw or len(raw) < 1:
-                rows = []
-            else:
-                header = raw[0]
-                header_map = {i: normalize_header(header[i]) for i in range(len(header))}
-                rows = []
-                for row in raw[1:]:
-                    r = {"name": "", "address": "", "comment": "", "contact": "", "agent": "", "date": ""}
-                    for i, val in enumerate(row):
-                        key = header_map.get(i, "")
-                        if key in r:
-                            r[key] = str(val).strip()
-                    if any(v for v in r.values()):
-                        rows.append(r)
-            _sheet_cache["rows"] = rows
-            _sheet_cache["ts"] = now
-            if DEBUG_MODE:
-                logging.info(f"Read {len(rows)} rows from sheet (refreshed).")
-            return rows
-        except Exception:
-            logging.exception("⚠️ read_sheet_cached error")
-            return _sheet_cache.get("rows", [])
+        bot.send_message(msg.chat.id, "\n".join(text), reply_markup=start_only_kb())
+        st.step = "WAIT_START_OR_BACK"
+        return
 
-def clear_sheet_cache():
-    global _sheet_cache
-    with _sheet_lock:
-        _sheet_cache = {"ts": None, "rows": []}
-
-# ---------------- SQLite helpers (WAL + retry) ----------------
-def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-    except Exception:
-        pass
-    return conn
-
-def db_execute(query, params=(), fetch=False, retries=6, retry_delay=0.5):
-    for attempt in range(retries):
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(query, params)
-            data = cur.fetchall() if fetch else None
-            conn.commit()
-            conn.close()
-            return data
-        except sqlite3.OperationalError as e:
-            msg = str(e).lower()
-            if "database is locked" in msg:
-                if DEBUG_MODE:
-                    logging.warning(f"DB locked (attempt {attempt+1}/{retries}), retrying...")
-                time.sleep(retry_delay)
-                continue
-            else:
-                logging.exception("DB operational error")
-                raise
-    logging.error("DB execute failed after retries: %s %s", query, params)
-    return None
-
-def init_db():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS pending (
-            chat_id INTEGER PRIMARY KEY,
-            state TEXT,
-            temp_name TEXT,
-            temp_address TEXT,
-            temp_decision_contact TEXT,
-            temp_comment TEXT
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "WAIT_START_OR_BACK")
+def wait_start(msg: types.Message):
+    st = user_state[msg.chat.id]
+    if msg.text == "🧾 Start":
+        st.step = "CONFIRM_NAME"
+        bot.send_message(
+            msg.chat.id,
+            "სტარტი ✅\nგაიმეორე სასტუმროს <b>სახელი (ინგლისურად)</b>, ზუსტად ის, რასაც ეძებდი."
         )
-    ''')
-    conn.commit()
-    conn.close()
+    else:
+        # back to main
+        st.step = "IDLE"
+        st.pending = PendingHotel()
+        bot.send_message(msg.chat.id, "დაბრუნდი მთავარ მენიუში.", reply_markup=main_menu())
 
-init_db()
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "CONFIRM_NAME")
+def confirm_name(msg: types.Message):
+    st = user_state[msg.chat.id]
+    typed = msg.text.strip()
+    expected = st.pending.name_en or ""
+    score = fuzz.WRatio(normalize(typed), normalize(expected))
+    if score < EXACT_THRESHOLD:
+        bot.send_message(
+            msg.chat.id,
+            f"შეყვანილი სახელი <b>არ ემთხვევა</b> საძიებო მნიშვნელობას ({score}%).\n"
+            "გთხოვ, ჩასწორე ან ხელახლა შეიყვანე ზუსტად."
+        )
+        return
+    st.pending.name_en = typed  # lock
+    st.step = "CONFIRM_ADDR"
+    bot.send_message(msg.chat.id, "ახლა გაიმეორე <b>მისამართი (ქართულად)</b>.")
 
-# ---------------- Utilities & fuzzy matching ----------------
-def normalize(text: str) -> str:
-    if not text:
-        return ""
-    s = str(text).strip().lower()
-    s = s.replace("\n", " ").replace("\r", " ")
-    for token in ["სასტუმრო", "ქ.", "ქალაქი"]:
-        s = s.replace(token, "")
-    return " ".join(s.split())
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "CONFIRM_ADDR")
+def confirm_addr(msg: types.Message):
+    st = user_state[msg.chat.id]
+    typed = msg.text.strip()
+    expected = st.pending.addr_ge or ""
+    score = fuzz.WRatio(normalize(typed), normalize(expected))
+    if score < EXACT_THRESHOLD:
+        bot.send_message(
+            msg.chat.id,
+            f"მისამართი <b>არ ემთხვევა</b> საძიებო მნიშვნელობას ({score}%).\n"
+            "გთხოვ, ჩასწორე ან ხელახლა შეიყვანე ზუსტად."
+        )
+        return
+    st.pending.addr_ge = typed  # lock
+    # proceed to first question
+    st.step = "ASK_Q"
+    st.current_q_idx = 0
+    ask_next_question(msg.chat.id)
 
-def similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+def ask_next_question(chat_id: int):
+    st = user_state[chat_id]
+    if st.current_q_idx >= len(QUESTIONS):
+        # done
+        append_response_row(st)
+        bot.send_message(
+            chat_id,
+            "მადლობა! ინფორმაცია ჩაიწერა შიტში. ✅",
+            reply_markup=main_menu()
+        )
+        st.step = "IDLE"
+        st.answers = {}
+        st.current_q_idx = 0
+        return
 
-def find_best_sheet_match(name_input: str, address_input: str, rows: list):
-    if not rows:
-        return None, 0.0
-    n_in = normalize(name_input)
-    a_in = normalize(address_input)
+    key, text = QUESTIONS[st.current_q_idx]
+    bot.send_message(chat_id, text)
 
-    best = None
-    best_score = 0.0
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "ASK_Q")
+def on_answer(msg: types.Message):
+    st = user_state[msg.chat.id]
+    key, _ = QUESTIONS[st.current_q_idx]
+    st.answers[key] = msg.text.strip()
+    st.current_q_idx += 1
+    ask_next_question(msg.chat.id)
 
-    for r in rows:
-        rn = r.get("name", "") or ""
-        ra = r.get("address", "") or ""
-        rn_n = normalize(rn)
-        ra_n = normalize(ra)
+# --------------- Utilities ---------------
+@app.get("/")
+def health():
+    return "ok", 200
 
-        # exact address priority
-        if ra_n and a_in and ra_n == a_in:
-            ns = similarity(n_in, rn_n)
-            score = 0.88 + (ns * 0.11)
-            if score > best_score:
-                best = r
-                best_score = score
-            continue
+@app.post(f"/{TELEGRAM_TOKEN}")
+def telegram_webhook():
+    json_update = request.get_data().decode("utf-8")
+    update = telebot.types.Update.de_json(json_update)
+    bot.process_new_updates([update])
+    return "!", 200
 
-        # combined fuzzy
-        name_sim = similarity(n_in, rn_n)
-        addr_sim = similarity(a_in, ra_n)
-        combined = 0.65 * name_sim + 0.35 * addr_sim
-        if combined > best_score:
-            best = r
-            best_score = combined
-
-    return best, best_score
-
-# ---------------- Telegram helpers ----------------
-def send_message(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
-        if DEBUG_MODE:
-            logging.info("Telegram send status: %s %s", getattr(r, "status_code", None), getattr(r, "text", None))
-    except Exception:
-        logging.exception("⚠️ Telegram send error")
-
-def keyboard_search_only():
-    return {"keyboard": [[{"text": "მოძებნე. 🔍"}]], "resize_keyboard": True, "one_time_keyboard": False}
-
-def keyboard_main():
-    return {"keyboard": [[{"text": "მოძებნე. 🔍"}, {"text": "დაწყება / start. 🚀"}], [{"text": "/myhotels"}]], "resize_keyboard": True}
-
-# ---------------- Pending helpers ----------------
-def set_pending(chat_id, state, temp_name=None, temp_address=None, temp_decision_contact=None, temp_comment=None):
-    db_execute("REPLACE INTO pending (chat_id, state, temp_name, temp_address, temp_decision_contact, temp_comment) VALUES (?, ?, ?, ?, ?, ?)",
-               (chat_id, state, temp_name, temp_address, temp_decision_contact, temp_comment))
-
-def get_pending(chat_id):
-    res = db_execute("SELECT state, temp_name, temp_address, temp_decision_contact, temp_comment FROM pending WHERE chat_id=?", (chat_id,), fetch=True)
-    return res[0] if res else (None, None, None, None, None)
-
-def clear_pending(chat_id):
-    db_execute("DELETE FROM pending WHERE chat_id=?", (chat_id,))
-
-# ---------------- Sheet append with duplicate prevention ----------------
-def sheet_has_duplicate(name, address, rows=None):
-    if rows is None:
-        rows = read_sheet_cached()
-    best, score = find_best_sheet_match(name, address, rows)
-    if best and score >= FUZZY_STRONG:
-        return True, best, score
-    return False, best, score
-
-def append_to_sheet_safe(name, address, comment, contact, agent):
-    if not sheet:
-        return False, "Sheet not configured"
-    rows = read_sheet_cached(force=True)
-    is_dup, best, score = sheet_has_duplicate(name, address, rows)
-    if is_dup:
-        return False, f"duplicate (score={score:.2f})"
-    try:
-        with _sheet_lock:
-            sheet.append_row([name, address, comment, contact, agent, datetime.now().strftime("%Y-%m-%d %H:%M")], value_input_option="USER_ENTERED")
-            clear_sheet_cache()
-        return True, "ok"
-    except Exception as e:
-        logging.exception("⚠️ Sheet append error")
-        return False, str(e)
-
-# ---------------- Webhook handler ----------------
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    update = request.get_json(force=True)
-    if not update:
-        return jsonify({"ok": True})
-    if 'message' not in update:
-        return jsonify({"ok": True})
-
-    msg = update['message']
-    chat_id = msg['chat']['id']
-    text = msg.get('text', '').strip()
-    if not text:
-        return jsonify({"ok": True})
-
-    state, temp_name, temp_address, temp_decision_contact, temp_comment = get_pending(chat_id)
-
-    # /myhotels command
-    if text.strip().lower() in ('/myhotels', 'myhotels'):
-        rows = read_sheet_cached()
-        if not rows:
-            send_message(chat_id, "ჩანაწერები არ მოიძებნა.", reply_markup=keyboard_main())
-            return jsonify({"ok": True})
-        out = "<b>ჩაწერილი სასტუმროები (ბოლო):</b>\n"
-        for r in rows[-40:]:
-            out += f"\n🏷️ <b>{r.get('name') or '-'}</b>\n📍 {r.get('address') or '-'}\n💬 {r.get('comment') or '-'}\n"
-        send_message(chat_id, out, reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    # start search
-    if text in ("მოძებნე. 🔍", "მოძებნე", "მოძებნე 🔍"):
-        set_pending(chat_id, "awaiting_search_name")
-        send_message(chat_id, "გთხოვთ ჩაწეროთ სასტუმროს <b>სახელი</b> საძიებლად.", reply_markup=keyboard_search_only())
-        return jsonify({"ok": True})
-
-    # start registration
-    if text in ("დაწყება / start. 🚀", "დაწყება", "/start", "start"):
-        set_pending(chat_id, "awaiting_name")
-        send_message(chat_id, "დავიწყოთ რეგისტრაცია. გთხოვთ ჩაწეროთ — <b>სასტუმროს დასახელება</b>.", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    # SEARCH FLOW: name -> address -> check
-    if state == "awaiting_search_name":
-        set_pending(chat_id, "awaiting_search_address", temp_name=text)
-        send_message(chat_id, "შეიყვანეთ სასტუმროს <b>ოფიციალური მისამართი</b> (ქუჩა, ნომერი, ქალაქი), მეტი სიზუსტისთვის.", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    if state == "awaiting_search_address":
-        search_name = temp_name or ""
-        search_address = text or ""
-        if not sheet:
-            send_message(chat_id, "⚠️ Google Sheet არ არის კონფიგურირებული. ვერ შევამოწმებ ბაზას.", reply_markup=keyboard_main())
-            clear_pending(chat_id)
-            return jsonify({"ok": True})
-
-        rows = read_sheet_cached()
-        # exact name + address
-        for r in rows:
-            if normalize(r.get("name")) == normalize(search_name) and normalize(r.get("address")) == normalize(search_address):
-                comment = r.get("comment") or "კომენტარი არ არის."
-                send_message(chat_id,
-                             f"❌ ამ აბონენტისთვის უკვე გაგზავნილია ჩვენი შეთავაზება.\n\n🏨 <b>{r.get('name')}</b>\n📍 {r.get('address')}\n💬 <i>{comment}</i>",
-                             reply_markup=keyboard_main())
-                clear_pending(chat_id)
-                return jsonify({"ok": True})
-        # exact address
-        for r in rows:
-            if normalize(r.get("address")) == normalize(search_address) and r.get("address"):
-                comment = r.get("comment") or "კომენტარი არ არის."
-                send_message(chat_id,
-                             f"❌ მისამართით მოიძებნა ჩანაწერი:\n🏨 <b>{r.get('name')}</b>\n📍 {r.get('address')}\n💬 <i>{comment}</i>",
-                             reply_markup=keyboard_main())
-                clear_pending(chat_id)
-                return jsonify({"ok": True})
-        # fuzzy combined
-        best, score = find_best_sheet_match(search_name, search_address, rows)
-        if best and score >= FUZZY_STRONG:
-            comment = best.get("comment") or "კომენტარი არ არის."
-            send_message(chat_id, f"❌ ძალიან მსგავს ჩანაწერს აქვს: <b>{best.get('name')}</b>\n📍 {best.get('address')}\n💬 <i>{comment}</i>\n(შეფასება: {score:.2f})", reply_markup=keyboard_main())
-        elif best and score >= FUZZY_MEDIUM:
-            send_message(chat_id, f"🔎 ნაპოვნია მსგავსი ჩანაწერი: <b>{best.get('name')}</b>\n📍 {best.get('address')}\n💬 <i>{best.get('comment') or 'არ არის'}</i>\n(მსგავსების სკორი: {score:.2f})", reply_markup=keyboard_main())
-        else:
-            send_message(chat_id, "✅ ამ სასტუმროსთვის ჩანაწერი არ მოიძებნა. თუ გსურთ, დააწკაპუნეთ \"დაწყება / start. 🚀\" რეგისტრაციისთვის.", reply_markup=keyboard_main())
-
-        clear_pending(chat_id)
-        return jsonify({"ok": True})
-
-    # REGISTRATION FLOW: name -> address -> decision contact -> comment -> agent -> append
-    if state == "awaiting_name":
-        set_pending(chat_id, "awaiting_address", temp_name=text)
-        send_message(chat_id, "სახელი მიღებულია. გთხოვთ ჩაწეროთ — <b>მისამართი. 📍</b>", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    if state == "awaiting_address":
-        set_pending(chat_id, "awaiting_decision_contact", temp_name=temp_name, temp_address=text)
-        send_message(chat_id, "მისამართი მიღებულია. გთხოვთ მიუთითოთ — <b>გადამწყვეტი პირის კონტაქტი (ტელეფონი ან მეილი)</b>.", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    if state == "awaiting_decision_contact":
-        set_pending(chat_id, "awaiting_comment", temp_name=temp_name, temp_address=temp_address, temp_decision_contact=text)
-        send_message(chat_id, "კონტაქტი მიღებულია. ახლა დაწერეთ — <b>კომენტარი. 📝</b>", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    if state == "awaiting_comment":
-        set_pending(chat_id, "awaiting_agent", temp_name=temp_name, temp_address=temp_address, temp_decision_contact=temp_decision_contact, temp_comment=text)
-        send_message(chat_id, "კომენტარი მიღებულია. გთხოვთ ჩაწეროთ — <b>აგენტის სახელი და გვარი. 👤</b>", reply_markup=keyboard_main())
-        return jsonify({"ok": True})
-
-    if state == "awaiting_agent":
-        agent = text.strip()
-        name_final = temp_name or ""
-        address_final = temp_address or ""
-        contact_final = temp_decision_contact or ""
-        comment_final = temp_comment or ""
-        agent_final = agent or ""
-
-        logging.info(f"Attempt append: {name_final} | {address_final} | {agent_final}")
-
-        rows = read_sheet_cached()
-        is_dup, best, score = sheet_has_duplicate(name_final, address_final, rows)
-        if is_dup:
-            comment = best.get("comment") or "კომენტარი არ არის."
-            send_message(chat_id, f"❌ ამ აბონენტისთვის უკვე გაგზავნილია ჩვენი შეთავაზება.\n💬 <i>{comment}</i>", reply_markup=keyboard_main())
-            clear_pending(chat_id)
-            return jsonify({"ok": True})
-
-        ok, info = append_to_sheet_safe(name_final, address_final, comment_final, contact_final, agent_final)
-        logging.info("Append result: %s %s", ok, info)
-        if ok:
-            send_message(chat_id, "✅ ჩანაწერი წარმატებით დაემატა Google Sheet-ში. 🥰", reply_markup=keyboard_main())
-        else:
-            send_message(chat_id, f"⚠️ ჩანაწერის დამატება ვერ მოხერხდა: {info}", reply_markup=keyboard_main())
-        clear_pending(chat_id)
-        return jsonify({"ok": True})
-
-    # fallback
-    send_message(chat_id, "გთხოვთ დაიწყოთ ღილაკით \"მოძებნე. 🔍\" ან გამოიყენეთ /myhotels რათა ნახოთ ჩანაწერები.", reply_markup=keyboard_main())
-    return jsonify({"ok": True})
-
-# ---------------- INDEX ----------------
-@app.route('/')
-def index():
-    return "HotelClaimBot is running."
-
-# ---------------- MAIN ----------------
-if __name__ == '__main__':
-    webhook_host = os.environ.get("WEBHOOK_HOST", "https://ok-tv-1.onrender.com")
-    webhook_url = f"{webhook_host.rstrip('/')}/{BOT_TOKEN}"
-    logging.info("Setting webhook to: %s", webhook_url)
-    try:
-        r = requests.get(f"{API_URL}/setWebhook?url={webhook_url}", timeout=10)
-        logging.info("Webhook set response: %s", getattr(r, "text", str(r)))
-    except Exception:
-        logging.exception("⚠️ Webhook set failed")
-    # for production consider gunicorn; this is ok for small Render services
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+if __name__ == "__main__":
+    # local run (Render-ზე მუშაობს gunicorn-ით, აქ მხოლოდ dev)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
