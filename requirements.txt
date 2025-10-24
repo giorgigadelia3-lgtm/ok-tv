@@ -1,6 +1,5 @@
-Flask
-pyTelegramBotAPI==4.14.0
-gunicorn
-gspread
-google-auth
-rapidfuzz
+Flask==2.2.5
+pyTelegramBotAPI==4.12.0
+gspread==6.0.2
+oauth2client==4.1.3
+gunicorn==21.2.0
