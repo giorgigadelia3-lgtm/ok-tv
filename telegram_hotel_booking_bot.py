@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -8,34 +9,42 @@ from flask import Flask, request
 import telebot
 from telebot import types
 
-# === Google Sheets ===
+# ===== Google Sheets =====
 import gspread
 from google.oauth2.service_account import Credentials
 
-# === Fuzzy matching ===
-from rapidfuzz import fuzz, process
+# ===== Fuzzy matching =====
+from rapidfuzz import fuzz
 
 # ---------------------------
-# ENVIRONMENT / CONFIG
+# LOGGING
 # ---------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ---------------------------
+# ENV / CONFIG
+# ---------------------------
+# Required
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-
-# Service Account JSON მთელი ტექსტით env-ში:
-#   GOOGLE_SERVICE_ACCOUNT_JSON = {...}
-GSERVICE_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEET_KEY = os.environ["GSPREAD_SHEET_KEY"]  # Spreadsheet ID
-HOTELS_WS = os.getenv("HOTELS_WORKSHEET", "Hotels")  # worksheet name hotels list
+
+# Optional
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "1") == "1"
+
+HOTELS_WS = os.getenv("HOTELS_WORKSHEET", "Hotels")
 RESPONSES_WS = os.getenv("RESPONSES_WORKSHEET", "Responses")
 
-# Column names (header row-ს მიხედვით). შეცვლადი env-ებით.
 COL_NAME_EN = os.getenv("HOTELS_NAME_COLUMN", "name_en")
 COL_ADDR_GE = os.getenv("HOTELS_ADDRESS_COLUMN", "address_ge")
-COL_STATUS = os.getenv("HOTELS_STATUS_COLUMN", "status")   # 'X', '✅' etc. = surveyed
+COL_STATUS = os.getenv("HOTELS_STATUS_COLUMN", "status")
 COL_COMMENT = os.getenv("HOTELS_COMMENT_COLUMN", "comment")
 
-# Matching thresholds
-EXACT_THRESHOLD = int(os.getenv("MATCH_EXACT_THRESHOLD", "90"))
-SUGGEST_THRESHOLD = int(os.getenv("MATCH_SUGGEST_THRESHOLD", "70"))
+# Fuzzy thresholds
+EXACT_THRESHOLD = int(os.getenv("MATCH_EXACT_THRESHOLD", "90"))      # must match to confirm
+SUGGEST_THRESHOLD = int(os.getenv("MATCH_SUGGEST_THRESHOLD", "70"))  # show suggestions above this
 
 # ---------------------------
 # BOT / WEB
@@ -50,7 +59,7 @@ app = Flask(__name__)
 class PendingHotel:
     name_en: Optional[str] = None
     addr_ge: Optional[str] = None
-    candidate_from_sheet: Optional[Dict[str, Any]] = None  # top suggestion (if any)
+    candidate_from_sheet: Optional[Dict[str, Any]] = None  # best suggestion (if any)
     found_status: Optional[str] = None  # "surveyed" | "unsurveyed" | "not_found"
 
 @dataclass
@@ -67,120 +76,144 @@ user_state: Dict[int, SurveyState] = {}  # chat_id -> state
 # GOOGLE SHEETS HELPERS
 # ---------------------------
 def gsheet_client():
-    info = json.loads(GSERVICE_JSON)
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+    gc = gspread.authorize(creds)
+    log.info("✅ Google Sheets connected.")
+    return gc
 
-def get_hotels_records() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Return (records, header_index_map)."""
+def get_hotels_records() -> List[Dict[str, Any]]:
     gc = gsheet_client()
     ws = gc.open_by_key(SHEET_KEY).worksheet(HOTELS_WS)
-    rows = ws.get_all_records()  # list[dict] using header row
-    # map lower headers
-    headers = {k.strip().lower(): k for k in rows[0].keys()} if rows else {}
-    # but safer: grab header row directly
-    header_row = ws.row_values(1)
-    header_idx = {h.strip().lower(): i for i, h in enumerate(header_row)}
-    return rows, header_idx
+    return ws.get_all_records()  # list[dict] based on header row
 
-def ensure_responses_header():
+def ensure_responses_ws():
     gc = gsheet_client()
     sh = gc.open_by_key(SHEET_KEY)
     try:
         ws = sh.worksheet(RESPONSES_WS)
+        return ws
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=RESPONSES_WS, rows=2000, cols=50)
-        ws.append_row([
+        ws.update("1:1", [[
             "timestamp", "name_en", "address_ge",
-            "matched_name_en", "matched_address_ge", "matched_status",
-            # dynamic Q headers appended later
-        ])
-    return ws
+            "matched_name_en", "matched_address_ge", "matched_status"
+        ]])
+        return ws
+
+def ensure_headers(ws, required_headers: List[str]):
+    headers = ws.row_values(1)
+    if not headers:
+        ws.update("1:1", [required_headers])
+        return required_headers
+
+    changed = False
+    for h in required_headers:
+        if h not in headers:
+            headers.append(h)
+            changed = True
+    if changed:
+        ws.update("1:1", [headers])
+    return headers
 
 def append_response_row(state: SurveyState):
-    ws = ensure_responses_header()
-    # ensure headers contain question keys (add if missing)
-    headers = ws.row_values(1)
+    ws = ensure_responses_ws()
+    # make sure all question keys exist in header
     q_keys = [k for k, _ in QUESTIONS]
-    missing = [k for k in q_keys if k not in headers]
-    if missing:
-        ws.add_cols(len(missing))
-        headers += missing
-        ws.update('A1', [headers])
-
-    row = [
-        time.strftime("%Y-%m-%d %H:%M:%S"),
-        state.pending.name_en or "",
-        state.pending.addr_ge or "",
-        (state.pending.candidate_from_sheet or {}).get(COL_NAME_EN, ""),
-        (state.pending.candidate_from_sheet or {}).get(COL_ADDR_GE, ""),
-        state.pending.found_status or "",
+    base = [
+        "timestamp", "name_en", "address_ge",
+        "matched_name_en", "matched_address_ge", "matched_status"
     ]
-    # pad to current headers length, then fill answers in correct columns
-    values = {**{k: "" for k in headers}}
-    # base columns:
-    values["timestamp"] = row[0]
-    values["name_en"] = row[1]
-    values["address_ge"] = row[2]
-    values["matched_name_en"] = row[3]
-    values["matched_address_ge"] = row[4]
-    values["matched_status"] = row[5]
-    # answers:
-    for k in state.answers:
-        values[k] = state.answers[k]
+    headers = ensure_headers(ws, base + q_keys)
 
-    ws.append_row([values.get(h, "") for h in headers], value_input_option="USER_ENTERED")
+    row_map = {h: "" for h in headers}
+    row_map["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    row_map["name_en"] = state.pending.name_en or ""
+    row_map["address_ge"] = state.pending.addr_ge or ""
+    row_map["matched_name_en"] = (state.pending.candidate_from_sheet or {}).get(COL_NAME_EN, "")
+    row_map["matched_address_ge"] = (state.pending.candidate_from_sheet or {}).get(COL_ADDR_GE, "")
+    row_map["matched_status"] = state.pending.found_status or ""
+    for k, v in state.answers.items():
+        row_map[k] = v
 
-def normalize(s: str) -> str:
+    ws.append_row([row_map[h] for h in headers], value_input_option="USER_ENTERED")
+
+
+# ---------------------------
+# MATCHING
+# ---------------------------
+def _normalize(s: str) -> str:
     return "".join(ch for ch in s.lower().strip() if ch.isalnum() or ch.isspace())
 
+def _is_surveyed(status_cell: str) -> bool:
+    s = (status_cell or "").strip().lower()
+    return s in {"x", "✓", "✅", "yes", "true", "done", "surveyed"}
+
 def match_hotels(name_en: str, addr_ge: str):
-    """Return best match info: (found_status, best_row_or_None, best_score, suggestions)"""
-    records, _ = get_hotels_records()
+    """
+    Returns: (found_status, best_row_or_None, best_score_int, suggestions_list[(score,name_score,addr_score,row),...])
+    found_status ∈ {"surveyed","unsurveyed","not_found"}
+    """
+    records = get_hotels_records()
     if not records:
         return "not_found", None, 0, []
 
-    cand_scores = []
+    cands = []
+    n1 = _normalize(name_en)
+    a1 = _normalize(addr_ge)
+
     for row in records:
         r_name = str(row.get(COL_NAME_EN, "") or "")
         r_addr = str(row.get(COL_ADDR_GE, "") or "")
-        name_score = fuzz.WRatio(normalize(name_en), normalize(r_name))
-        addr_score = fuzz.WRatio(normalize(addr_ge), normalize(r_addr)) if addr_ge else 0
-        # weighted combo: name 70%, address 30%
+
+        name_score = fuzz.WRatio(n1, _normalize(r_name))
+        addr_score = fuzz.WRatio(a1, _normalize(r_addr)) if a1 else 0
         combo = int(0.7 * name_score + 0.3 * addr_score)
-        cand_scores.append((combo, name_score, addr_score, row))
+        cands.append((combo, name_score, addr_score, row))
 
-    cand_scores.sort(reverse=True, key=lambda x: x[0])
-    best = cand_scores[0]
-    suggestions = [c for c in cand_scores[:5] if c[0] >= SUGGEST_THRESHOLD]
+    cands.sort(key=lambda x: x[0], reverse=True)
+    best_combo, best_name, best_addr, best_row = cands[0]
 
-    best_combo, best_name, best_addr, best_row = best
-    status_cell = str(best_row.get(COL_STATUS, "") or "").strip().lower()
-    is_surveyed = status_cell in ("x", "✅", "yes", "true", "done", "surveyed")
+    suggestions = [c for c in cands[:5] if c[0] >= SUGGEST_THRESHOLD]
+    status_cell = str(best_row.get(COL_STATUS, "") or "")
 
     if best_combo >= EXACT_THRESHOLD:
-        return ("surveyed" if is_surveyed else "unsurveyed"), best_row, best_combo, suggestions
+        return ("surveyed" if _is_surveyed(status_cell) else "unsurveyed"), best_row, best_combo, suggestions
     else:
-        # no strong match
+        # not a strong match
         if suggestions:
-            # still present "similar" list for human check
-            return ("surveyed" if is_surveyed and best_combo >= SUGGEST_THRESHOLD else "not_found"), best_row, best_combo, suggestions
+            # might still show top suggestion as hint
+            return ("surveyed" if _is_surveyed(status_cell) else "not_found"), best_row, best_combo, suggestions
         return "not_found", None, 0, []
 
 
 # ---------------------------
-# QUESTIONS (შენი არსებული ბლოკის ადგილი)
-# სურვილისამებრ ჩაანაცვლე/დაამატე
+# QUESTIONS (can be overridden via QUESTIONS_JSON env)
 # ---------------------------
-QUESTIONS: List[Tuple[str, str]] = [
+def load_questions_from_env() -> List[Tuple[str, str]]:
+    raw = os.getenv("QUESTIONS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        out = []
+        for item in data:
+            # item: {"key": "...", "text": "..."}
+            out.append((item["key"], item["text"]))
+        return out
+    except Exception as e:
+        log.warning("QUESTIONS_JSON parse error: %s", e)
+        return []
+
+QUESTIONS: List[Tuple[str, str]] = load_questions_from_env() or [
     ("contact_person", "კონტაქტის სახელი და გვარი?"),
     ("phone", "ტელეფონის ნომერი?"),
     ("rooms_count", "რამდენი ნომერია სასტუმროში?"),
     ("email", "ელფოსტა?"),
     ("notes", "დამატებითი კომენტარი?"),
 ]
-# თუ გინდა მთლიანად შენი ბლოკი — უბრალოდ შეცვალე QUESTIONS.
+
 
 # ---------------------------
 # KEYBOARDS
@@ -194,6 +227,7 @@ def start_only_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     kb.row(types.KeyboardButton("🧾 Start"), types.KeyboardButton("↩️ დაბრუნება მენიუში"))
     return kb
+
 
 # ---------------------------
 # BOT HANDLERS
@@ -248,31 +282,35 @@ def perform_lookup(msg: types.Message):
         comment = ""
         if best_row and COL_COMMENT in best_row and best_row[COL_COMMENT]:
             comment = f"\nკომენტარი: <i>{best_row[COL_COMMENT]}</i>"
-        pretty = f"ნაპოვნია: <b>{best_row.get(COL_NAME_EN,'')}</b>\nმისამართი: {best_row.get(COL_ADDR_GE,'')}\nსტატუსი: ❌ უკვე გამოკითხულია.{comment}"
+        pretty = (
+            f"ნაპოვნია: <b>{best_row.get(COL_NAME_EN,'')}</b>\n"
+            f"მისამართი: {best_row.get(COL_ADDR_GE,'')}\n"
+            f"სტატუსი: ❌ უკვე გამოკითხულია.{comment}"
+        )
         bot.send_message(msg.chat.id, pretty, reply_markup=main_menu())
         # დასრულება
         st.step = "IDLE"
         return
 
-    if status in ("unsurveyed", "not_found"):
-        text = []
-        if status == "unsurveyed":
-            text.append("ნაპოვნია მსგავსი სასტუმრო, მაგრამ <b>არ არის გამოკითხული</b> (შიტში არ აქვს 'X').")
-        else:
-            text.append("ასეთი სასტუმრო შიტში <b>დე ფაქტო ვერ ვიპოვე</b>.")
+    # unsurveyed or not_found
+    text_lines = []
+    if status == "unsurveyed":
+        text_lines.append("ნაპოვნია მსგავსი სასტუმრო, მაგრამ <b>არ არის გამოკითხული</b> (შიტში არ აქვს 'X').")
+    else:
+        text_lines.append("ასეთი სასტუმრო შიტში <b>ვერ ვიპოვე</b> ან ზუსტი დამთხვევა არ არის.")
 
-        if suggestions:
-            text.append("\nახლოს მყოფი ვარიანტები:")
-            for i, (combo, nsc, asc, row) in enumerate(suggestions, start=1):
-                status_cell = str(row.get(COL_STATUS, "") or "").strip()
-                mark = "❌" if status_cell.lower() in ("x", "✅", "yes", "true", "done", "surveyed") else "🟢"
-                text.append(f"{i}) {row.get(COL_NAME_EN,'')} — {row.get(COL_ADDR_GE,'')}  [{mark}] ({combo}%)")
-            text.append("\nთუ ზემოთ მოცემული უკვე '❌' აღნიშვნითაა — გამოკითხულია და დასრულებულია.\n"
-                        "თუ არა — შეგიძლია დააჭირო <b>Start</b> და გააგრძელო შევსება.")
+    if suggestions:
+        text_lines.append("\nახლოს მყოფი ვარიანტები:")
+        for i, (combo, nsc, asc, row) in enumerate(suggestions, start=1):
+            mark = "❌" if _is_surveyed(str(row.get(COL_STATUS, ""))) else "🟢"
+            text_lines.append(f"{i}) {row.get(COL_NAME_EN,'')} — {row.get(COL_ADDR_GE,'')}  [{mark}] ({combo}%)")
+        text_lines.append(
+            "\nთუ ზემოთ მოცემული უკვე '❌' აღნიშვნითაა — გამოკითხულია და დასრულებულია.\n"
+            "თუ არა — დააჭირე <b>Start</b> და გააგრძელე შევსება."
+        )
 
-        bot.send_message(msg.chat.id, "\n".join(text), reply_markup=start_only_kb())
-        st.step = "WAIT_START_OR_BACK"
-        return
+    bot.send_message(msg.chat.id, "\n".join(text_lines), reply_markup=start_only_kb())
+    st.step = "WAIT_START_OR_BACK"
 
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id, SurveyState()).step == "WAIT_START_OR_BACK")
 def wait_start(msg: types.Message):
@@ -294,7 +332,7 @@ def confirm_name(msg: types.Message):
     st = user_state[msg.chat.id]
     typed = msg.text.strip()
     expected = st.pending.name_en or ""
-    score = fuzz.WRatio(normalize(typed), normalize(expected))
+    score = fuzz.WRatio(_normalize(typed), _normalize(expected))
     if score < EXACT_THRESHOLD:
         bot.send_message(
             msg.chat.id,
@@ -311,7 +349,7 @@ def confirm_addr(msg: types.Message):
     st = user_state[msg.chat.id]
     typed = msg.text.strip()
     expected = st.pending.addr_ge or ""
-    score = fuzz.WRatio(normalize(typed), normalize(expected))
+    score = fuzz.WRatio(_normalize(typed), _normalize(expected))
     if score < EXACT_THRESHOLD:
         bot.send_message(
             msg.chat.id,
@@ -351,7 +389,10 @@ def on_answer(msg: types.Message):
     st.current_q_idx += 1
     ask_next_question(msg.chat.id)
 
-# --------------- Utilities ---------------
+
+# ---------------------------
+# WEBHOOK / HEALTH
+# ---------------------------
 @app.get("/")
 def health():
     return "ok", 200
@@ -363,7 +404,20 @@ def telegram_webhook():
     bot.process_new_updates([update])
     return "!", 200
 
+def maybe_set_webhook():
+    if not APP_BASE_URL or not AUTO_SET_WEBHOOK:
+        return
+    url = f"{APP_BASE_URL}/{TELEGRAM_TOKEN}"
+    try:
+        ok = bot.set_webhook(url=url)
+        log.info("Webhook set to %s -> %s", url, ok)
+    except Exception as e:
+        log.warning("Webhook set failed: %s", e)
+
+# Set webhook once on import (gunicorn workers may call multiple times; it's idempotent)
+maybe_set_webhook()
+
 if __name__ == "__main__":
-    # local run (Render-ზე მუშაობს gunicorn-ით, აქ მხოლოდ dev)
+    # Local dev only. On Render use gunicorn via startCommand.
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
