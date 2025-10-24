@@ -4,4 +4,3 @@ gunicorn
 gspread
 google-auth
 rapidfuzz
-
