@@ -1,25 +1,5 @@
+# telegram_hotel_booking_bot.py
 # -*- coding: utf-8 -*-
-"""
-OK TV - HotelClaimBot (Webhook mode, Render)
-ფუნქციონალი:
-- ღილაკი "🔍 მოძებნა"
-  1) სთხოვს სასტუმროს ოფიციალურ სახელს (EN)
-  2) სთხოვს ოფიციალურ მისამართს (KA)
-  3) Google Sheet-ში ზუსტად/მსგავსად ეძებს:
-     - ზუსტი + სტატუსი = done/surveyed/completed/აღებულია/გაკეთებულია -> აჩვენებს კომენტარს და ავტომატურად ასრულებს ჩატს
-     - მსგავსი -> სთავაზობს "დიახ/არა"; "დიახ" შემთხვევაში თუ არ არის done -> აძლევს "სტარტს"
-     - ვერ იპოვა -> აძლევს "სტარტს"
-  4) "სტარტი" შემდეგ ისევ სთხოვს სახელსა და მისამართს, პოულობს თუ ემთხვევა მოძიებულს (ან გიდის მსგავსად დაეხმაროს),
-     მერე იწყებს კითხვარს და ბოლოს წერს "Leads" worksheet-ში.
-
-ENV:
-- TELEGRAM_TOKEN
-- APP_BASE_URL  ( напр: https://ok-tv-1.onrender.com )
-- SPREADSHEET_ID
-- GOOGLE_SERVICE_ACCOUNT_JSON  (service account JSON როგორც სტრინგი)
-Start Command (Render):
-  gunicorn telegram_hotel_booking_bot:app --bind 0.0.0.0:$PORT --timeout 120
-"""
 import os
 import json
 import time
@@ -35,17 +15,18 @@ from telebot.types import (
 )
 
 import gspread
+from google.oauth2.service_account import Credentials
 from rapidfuzz import fuzz, process
 
-# -------------------- Logging --------------------
+# -------------------- ლოგირება --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hotel-bot")
 
-# -------------------- ENV ------------------------
+# -------------------- ENV -------------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-APP_BASE_URL   = os.environ.get("APP_BASE_URL")
-SHEET_ID       = os.environ.get("SPREADSHEET_ID")
-SERVICE_JSON   = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+APP_BASE_URL   = os.environ.get("APP_BASE_URL")                 # напр: https://ok-tv-1.onrender.com
+SHEET_ID       = os.environ.get("SPREADSHEET_ID")               # Google Sheet ID
+SERVICE_JSON   = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # service account JSON (string)
 
 missing = [k for k,v in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
@@ -58,373 +39,342 @@ if missing:
 
 SERVICE_INFO = json.loads(SERVICE_JSON)
 
-# -------------------- Flask + TeleBot ------------
+# -------------------- Flask + TeleBot --------------
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=True, num_threads=4, skip_pending=True)
 
-# -------------------- Google Sheets helpers ------
+# -------------------- Google Sheets ----------------
+"""
+Google Sheet:  “HotelClaimBot_Data”
+TAB/Worksheet: “1 ცხრილი”  (ზუსტად ასე წერია შენთან)
+Columns (A..F): hotel name | address | comment | Contact | agent | name
+"""
 def _gc_client():
-    return gspread.service_account_from_dict(SERVICE_INFO)
+    creds = Credentials.from_service_account_info(
+        SERVICE_INFO,
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"],
+    )
+    return gspread.authorize(creds)
 
-def _open_hotels_ws():
-    """
-    Hotels worksheet — აუცილებელი სვეტები ზუსტად ამ header-ებით:
-    name_en | address_ka | status | comment
-    """
+def _open_ws():
     gc = _gc_client()
     sh = gc.open_by_key(SHEET_ID)
-    return sh.worksheet("Hotels")
+    # ⚠️ აქაა მთავარი – შენთან worksheet ჰქვია „1 ცხრილი“
+    return sh.worksheet("1 ცხრილი")
 
-def _open_leads_ws():
-    """
-    Leads worksheet — მინიმუმ ეს სვეტები ამ რიგით:
-    created_at | agent_username | hotel_name_en | address_ka | matched | decision | comment | answers
-    """
-    gc = _gc_client()
-    sh = gc.open_by_key(SHEET_ID)
-    return sh.worksheet("Leads")
+# მარტივი cache რომ ყოველ მესიჯზე არ წავიკითხოთ მთელი ფურცელი
+_SHEET_CACHE: Dict[str, Any] = {"rows": [], "ts": 0}
+_CACHE_TTL_SEC = 90
 
-# პატარა cache რომ ყოველ მესიჯზე არ წავიკითხოთ მთელი შიტი
-_HOTELS_CACHE: Dict[str, Any] = {"rows": [], "ts": 0}
-_CACHE_TTL_SEC = 120
-
-def load_hotels(force: bool = False) -> List[Dict[str, Any]]:
+def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     now = time.time()
-    if (not force) and _HOTELS_CACHE["rows"] and (now - _HOTELS_CACHE["ts"] < _CACHE_TTL_SEC):
-        return _HOTELS_CACHE["rows"]
-    ws = _open_hotels_ws()
-    rows = ws.get_all_records()  # list[dict] — {name_en,address_ka,status,comment}
-    _HOTELS_CACHE["rows"] = rows
-    _HOTELS_CACHE["ts"] = now
-    logger.info(f"Loaded {len(rows)} hotels from sheet.")
+    if (not force) and _SHEET_CACHE["rows"] and (now - _SHEET_CACHE["ts"] < _CACHE_TTL_SEC):
+        return _SHEET_CACHE["rows"]
+    ws = _open_ws()
+    rows = ws.get_all_records()  # list[dict] with keys exactly as headers
+    _SHEET_CACHE["rows"] = rows
+    _SHEET_CACHE["ts"] = now
+    logger.info(f"Loaded {len(rows)} rows from sheet.")
     return rows
 
-def append_lead_row(data: Dict[str, Any]):
-    ws = _open_leads_ws()
-    row = [
-        data.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
-        data.get("agent_username", ""),
-        data.get("hotel_name_en", ""),
-        data.get("address_ka", ""),
-        data.get("matched", ""),
-        data.get("decision", ""),
-        data.get("matched_comment", ""),
-        json.dumps(data.get("answers", {}), ensure_ascii=False),
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+def append_row_new(hotel_name: str, address: str, comment: str, contact: str, agent_name: str):
+    ws = _open_ws()
+    # Columns: hotel name | address | comment | Contact | agent | name
+    timestamp = time.strftime("%d.%m.%y, %H:%M")
+    ws.append_row([hotel_name, address, comment, contact, agent_name, timestamp],
+                  value_input_option="USER_ENTERED")
 
-# -------------------- State / Session ------------
+# -------------------- Session (FSM) ----------------
 @dataclass
 class Session:
-    stage: str = "idle"  # idle -> ask_name -> ask_address -> checking -> suggest -> ready_to_start -> verify_inputs -> questionnaire
+    stage: str = "idle"  # idle -> ask_name -> ask_address -> checking -> suggest -> ready_to_start -> confirm_fixed -> questionnaire
     hotel_name_en: Optional[str] = None
     address_ka: Optional[str] = None
     best_match: Optional[Dict[str, Any]] = None
-    best_score_name: int = 0
-    best_score_addr: int = 0
+    score_name: int = 0
+    score_addr: int = 0
     answers: Dict[str, Any] = field(default_factory=dict)
 
 SESSIONS: Dict[int, Session] = {}
 
-def get_session(chat_id: int) -> Session:
+def sess(chat_id: int) -> Session:
     if chat_id not in SESSIONS:
         SESSIONS[chat_id] = Session()
     return SESSIONS[chat_id]
 
-# -------------------- UI -------------------------
-def main_menu() -> ReplyKeyboardMarkup:
+# -------------------- UI --------------------------
+def kb_main() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("🔍 მოძებნა"))
     return kb
 
-def start_menu() -> ReplyKeyboardMarkup:
+def kb_start() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("▶️ სტარტი"))
     kb.add(KeyboardButton("⬅️ უკან მენიუში"))
     return kb
 
-def normalize(s: str) -> str:
-    return (s or "").strip().lower()
+# -------------------- Helpers ---------------------
+def norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
 
-# -------------------- Match logic ----------------
-def find_best_hotel(hotel_name_en: str, address_ka: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
-    rows = load_hotels()
-    if not rows:
-        return None, 0, 0
+def find_best(hotel_name_en: str, address_ka: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
+    rows = load_rows()
+    names = [norm(r.get("hotel name", "")) for r in rows]
+    addrs = [norm(r.get("address", "")) for r in rows]
 
-    names = [r.get("name_en", "") for r in rows]
-    addrs = [r.get("address_ka", "") for r in rows]
-
-    name_match = process.extractOne(hotel_name_en, names, scorer=fuzz.WRatio)
-    addr_match = process.extractOne(address_ka,   addrs, scorer=fuzz.WRatio)
+    # RapidFuzz top-1 search by both fields
+    nm = process.extractOne(norm(hotel_name_en), names, scorer=fuzz.token_set_ratio)
+    am = process.extractOne(norm(address_ka),   addrs, scorer=fuzz.token_set_ratio)
 
     best = None
-    name_score = 0
-    addr_score = 0
+    nscore = 0
+    ascore = 0
 
-    # სახელის მიხედვით
-    if name_match:
-        _, name_score, idx = name_match
-        best = rows[idx]
-        name_score = int(name_score)
+    if nm:
+        _, nscore, idx_n = nm
+        best = rows[idx_n]
+        nscore = int(nscore)
 
-    # მისამართის მიხედვით
-    if addr_match:
-        _, addr_score, idx = addr_match
-        addr_score = int(addr_score)
-        # თუ მისამართის მიხედვით სხვა ინდექსია და ჯამური ქულა სჯობს — შევცვალოთ საუკეთესო
-        if best is None or idx != rows.index(best):
-            alt = rows[idx]
-            alt_name_score = int(fuzz.WRatio(hotel_name_en, alt.get("name_en", "")))
-            cur_addr_score = int(fuzz.WRatio(address_ka, (best or {}).get("address_ka", ""))) if best else 0
-            if (alt_name_score + addr_score) > (name_score + cur_addr_score):
+    if am:
+        _, ascore, idx_a = am
+        ascore = int(ascore)
+        if best is None or idx_a != rows.index(best):
+            alt = rows[idx_a]
+            alt_name_score = int(fuzz.token_set_ratio(norm(hotel_name_en), norm(alt.get("hotel name",""))))
+            cur_addr_score = int(fuzz.token_set_ratio(norm(address_ka), norm((best or {}).get("address","")))) if best else 0
+            if (alt_name_score + ascore) > (nscore + cur_addr_score):
                 best = alt
-                name_score = alt_name_score
+                nscore = alt_name_score
 
-    return best, name_score, addr_score
+    return best, nscore, ascore
 
-# -------------------- Bot handlers ---------------
+# -------------------- Bot handlers ----------------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    chat_id = message.chat.id
-    SESSIONS[chat_id] = Session(stage="idle")
-    bot.send_message(
-        chat_id,
-        "გაიხარე! აირჩიე მოქმედება 👇",
-        reply_markup=main_menu()
-    )
+    SESSIONS[message.chat.id] = Session(stage="idle")
+    bot.send_message(message.chat.id, "აირჩიე მოქმედება 👇", reply_markup=kb_main())
 
 @bot.message_handler(func=lambda m: m.text == "⬅️ უკან მენიუში")
 def back_to_menu(message):
     SESSIONS[message.chat.id] = Session(stage="idle")
-    bot.send_message(message.chat.id, "დაბრუნდი მთავარ მენიუში.", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "დაბრუნდი მთავარ მენიუში.", reply_markup=kb_main())
 
-# --------- ძიების დაწყება
 @bot.message_handler(func=lambda m: m.text == "🔍 მოძებნა")
 def search_entry(message):
-    chat_id = message.chat.id
-    s = get_session(chat_id)
+    s = sess(message.chat.id)
     s.stage = "ask_name"
     bot.send_message(
-        chat_id,
-        "გთხოვ, დაწერე სასტუმროს **ოფიციალური სახელი ინგლისურად** (მაგ.: *Radisson Blu Batumi*).",
-        parse_mode="Markdown"
+        message.chat.id,
+        "გთხოვ, შეიყვანე სასტუმროს <b>ოფიციალური სახელი ინგლისურად</b> (მაგ.: <i>Radisson Blu Batumi</i>).",
+        parse_mode="HTML"
     )
 
-# --------- ვკითხოთ მისამართი
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "ask_name")
-def ask_address_next(message):
-    chat_id = message.chat.id
-    s = get_session(chat_id)
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "ask_name")
+def ask_address(message):
+    s = sess(message.chat.id)
     s.hotel_name_en = message.text.strip()
     s.stage = "ask_address"
     bot.send_message(
-        chat_id,
-        "ახლა მიუთითე **ოფიციალური მისამართი ქართულად** (ქალაქი, ქუჩა, ნომერი).",
-        parse_mode="Markdown"
+        message.chat.id,
+        "ახლა შეიყვანე ამავე სასტუმროს <b>ოფიციალური მისამართი ქართულად</b> (ქალაქი, ქუჩა, №).",
+        parse_mode="HTML"
     )
 
-# --------- მოძებნა შიტში
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "ask_address")
-def check_in_sheet(message):
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "ask_address")
+def check_sheet(message):
     chat_id = message.chat.id
-    s = get_session(chat_id)
+    s = sess(chat_id)
     s.address_ka = message.text.strip()
     s.stage = "checking"
 
-    bm, nscore, ascore = find_best_hotel(s.hotel_name_en, s.address_ka)
-    s.best_match = bm
-    s.best_score_name = nscore
-    s.best_score_addr = ascore
+    best, nscore, ascore = find_best(s.hotel_name_en, s.address_ka)
+    s.best_match, s.score_name, s.score_addr = best, nscore, ascore
 
-    EXACT   = 92  # ძალიან მკაცრი ზუსტი
-    SIMILAR = 76  # შემოთავაზებისთვის
+    EXACT_BOTH = 95
+    SIMILAR_ONE = 80
 
-    if bm:
-        name_en = bm.get("name_en", "")
-        addr_ka = bm.get("address_ka", "")
-        status  = normalize(bm.get("status", ""))
-        comment = bm.get("comment", "")
+    if best:
+        name = best.get("hotel name", "")
+        addr = best.get("address", "")
+        comment = best.get("comment", "") or "—"
+        contact = best.get("Contact", "") or "—"
+        agent = best.get("agent", "") or "—"
 
-        # ზუსტი დამთხვევა + უკვე გამოკითხულია -> დასრულება
-        if nscore >= EXACT and ascore >= EXACT and status in ("done", "surveyed", "completed", "აღებულია", "გაკეთებულია"):
-            txt = (f"❌ ეს სასტუმრო უკვე **გამოკითხულია**.\n"
-                   f"სახელი: {name_en}\nმისამართი: {addr_ka}\n\n"
-                   f"კომენტარი: {comment or '—'}\n\n"
-                   f"ჩატი დასრულდა.")
-            bot.send_message(chat_id, txt, reply_markup=main_menu(), parse_mode="Markdown")
+        if nscore >= EXACT_BOTH and ascore >= EXACT_BOTH:
+            # ზუსტი დამთხვევა → უკვე გვაქვს ბაზაში → დასრულება
+            bot.send_message(
+                chat_id,
+                (
+                    "❌ <b>ეს სასტუმრო უკვე გამოკითხულია</b>.\n"
+                    f"🏨 <b>{name}</b>\n"
+                    f"📍 {addr}\n"
+                    f"💬 კომენტარი: <i>{comment}</i>\n"
+                    f"👤 აგენტი: {agent} | ☎️ {contact}\n\n"
+                    "ჩატი დასრულდა."
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_main()
+            )
             SESSIONS[chat_id] = Session(stage="idle")
             return
 
-        # მსგავსი ვარიანტის შემოთავაზება
-        if nscore >= SIMILAR or ascore >= SIMILAR:
+        if nscore >= SIMILAR_ONE or ascore >= SIMILAR_ONE:
+            # მსგავსი ჩანაწერი → შევთავაზოთ დადასტურება
             im = InlineKeyboardMarkup()
             im.add(
-                InlineKeyboardButton("✔️ დიახ, ესაა", callback_data="confirm_match"),
-                InlineKeyboardButton("✏️ არა, სხვაა", callback_data="reject_match"),
+                InlineKeyboardButton("✔️ დიახ, ეს სასტუმროა", callback_data="match_yes"),
+                InlineKeyboardButton("✏️ არა, სხვაა", callback_data="match_no")
             )
-            txt = (f"ვიპოვე **მსგავსი** ჩანაწერი. ხომ არ გულისხმობ ამას?\n\n"
-                   f"სახელი: *{name_en}*  (ქულა: {nscore})\n"
-                   f"მისამართი: *{addr_ka}* (ქულა: {ascore})")
-            bot.send_message(chat_id, txt, reply_markup=im, parse_mode="Markdown")
+            bot.send_message(
+                chat_id,
+                (
+                    "მოვძებნე <b>მსგავსი</b> ჩანაწერი, ხომ არ გულისხმობ ამას?\n\n"
+                    f"🏨 <b>{name}</b>  (ქულა სახელზე: {nscore})\n"
+                    f"📍 {addr}  (ქულა მისამართზე: {ascore})\n"
+                    f"💬 კომენტარი: <i>{comment}</i>"
+                ),
+                parse_mode="HTML",
+                reply_markup=im
+            )
             s.stage = "suggest"
             return
 
-    # ვერ ვიპოვეთ -> მივცეთ „სტარტი“
+    # ვერ ვიპოვეთ (ზუსტი/მსგავსიც არა) → მივცეთ გაგრძელება
     bot.send_message(
         chat_id,
-        "ამ სახელით/მისამართით ზუსტი ჩანაწერი ვერ ვიპოვე.\n"
-        "შეგიძლია ან დაუკავშირდე სასტუმროს, ან გააგრძელო მონაცემების შეგროვება.\n\n"
-        "გაგრძელებისთვის დააჭირე „▶️ სტარტი“.",
-        reply_markup=start_menu()
+        (
+            "ამ სახელზე/მისამართზე <b>ზუსტი ჩანაწერი ვერ ვიპოვე</b>.\n"
+            "შეგიძლია დაუკავშირდე ამ სასტუმროს, ან გააგრძელო ახალი ჩანაწერის შევსება.\n\n"
+            "გაგრძელებისთვის დააჭირე <b>▶️ სტარტი</b>."
+        ),
+        parse_mode="HTML",
+        reply_markup=kb_start()
     )
     s.stage = "ready_to_start"
 
-# --------- შემოთავაზებული მსგავსი ჩანაწერი — დიახ/არა
-@bot.callback_query_handler(func=lambda c: c.data in ("confirm_match", "reject_match"))
+@bot.callback_query_handler(func=lambda c: c.data in ("match_yes","match_no"))
 def on_suggestion_choice(call):
     chat_id = call.message.chat.id
-    s = get_session(chat_id)
+    s = sess(chat_id)
 
-    if call.data == "confirm_match" and s.best_match:
-        bm = s.best_match
-        status  = normalize(bm.get("status", ""))
-        comment = bm.get("comment", "")
-        name_en = bm.get("name_en", "")
-        addr_ka = bm.get("address_ka", "")
-
-        if status in ("done", "surveyed", "completed", "აღებულია", "გაკეთებულია"):
-            bot.edit_message_text(
-                chat_id=chat_id, message_id=call.message.message_id,
-                text=(f"❌ ეს სასტუმრო უკვე **გამოკითხულია**.\n"
-                      f"სახელი: {name_en}\nმისამართი: {addr_ka}\n\n"
-                      f"კომენტარი: {comment or '—'}\n\n"
-                      f"ჩატი დასრულდა."),
-                parse_mode="Markdown"
-            )
-            bot.send_message(chat_id, "დაბრუნდი მთავარ მენიუში.", reply_markup=main_menu())
-            SESSIONS[chat_id] = Session(stage="idle")
-            return
-        else:
-            bot.edit_message_text(
-                chat_id=chat_id, message_id=call.message.message_id,
-                text="კარგი, ეს ჩანაწერი არსებობს, მაგრამ დასრულებულად არაა მონიშნული. გავაგრძელოთ.\nდააჭირე „▶️ სტარტი“.",
-                parse_mode="Markdown"
-            )
-            s.stage = "ready_to_start"
-            bot.send_message(chat_id, "გაგრძელებისთვის:", reply_markup=start_menu())
-            return
-
-    # უარყოფილი -> სტარტი
-    bot.edit_message_text(
-        chat_id=chat_id, message_id=call.message.message_id,
-        text="გასაგებია — დავიწყოთ ახალი ჩანაწერი.\nდააჭირე „▶️ სტარტი“.",
-        parse_mode="Markdown"
-    )
-    s.stage = "ready_to_start"
-    bot.send_message(chat_id, "გაგრძელებისთვის:", reply_markup=start_menu())
-
-# --------- სტარტი -> ჯერ გადაამოწმებინოს იგივე სახელით/მისამართით
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "ready_to_start" and m.text == "▶️ სტარტი")
-def start_verification(message):
-    chat_id = message.chat.id
-    s = get_session(chat_id)
-    s.stage = "verify_inputs"
-    bot.send_message(chat_id, "გაიმეორე სასტუმროს **ოფიციალური სახელი (EN)**:", parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "verify_inputs" and get_session(m.chat.id).answers.get("v_name") is None)
-def verify_name(message):
-    s = get_session(message.chat.id)
-    s.answers["v_name"] = message.text.strip()
-    bot.send_message(message.chat.id, "ახლა ჩაწერე **ოფიციალური მისამართი (KA)**:", parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "verify_inputs" and get_session(m.chat.id).answers.get("v_name") is not None and get_session(m.chat.id).answers.get("v_addr") is None)
-def verify_address(message):
-    chat_id = message.chat.id
-    s = get_session(chat_id)
-    s.answers["v_addr"] = message.text.strip()
-
-    # შევადაროთ საწყისად მოძიებულს (თუ არსებობდა)
-    mismatch_msgs = []
-    if s.best_match:
-        bm_name = s.best_match.get("name_en", "")
-        bm_addr = s.best_match.get("address_ka", "")
-        name_ok = fuzz.WRatio(s.answers["v_name"], bm_name) >= 90
-        addr_ok = fuzz.WRatio(s.answers["v_addr"], bm_addr) >= 90
-        if not name_ok:
-            mismatch_msgs.append(f"სახელი არ ემთხვევა მოძიებულს: \n— მოძიებული: {bm_name}\n— შეყვანილი: {s.answers['v_name']}")
-        if not addr_ok:
-            mismatch_msgs.append(f"მისამართი არ ემთხვევა მოძიებულს: \n— მოძიებული: {bm_addr}\n— შეყვანილი: {s.answers['v_addr']}")
-
-    if mismatch_msgs:
-        bot.send_message(chat_id, "გთხოვ, შეასწორე:\n\n" + "\n\n".join(mismatch_msgs))
-        # დავაბრუნოთ თავიდან გადამოწმებაზე
-        s.answers.pop("v_name", None)
-        s.answers.pop("v_addr", None)
-        bot.send_message(chat_id, "გაიმეორე სასტუმროს **ოფიციალური სახელი (EN)**:", parse_mode="Markdown")
+    if call.data == "match_yes" and s.best_match:
+        # თუ მსგავსია, მაგრამ არ იყო EXACT → მაინც მივცეთ გაგრძელება (შეავსოს ახალი ინფორმაცია თუ საჭიროა)
+        bot.edit_message_text(
+            chat_id=chat_id, message_id=call.message.message_id,
+            text=(
+                "ეს ჩანაწერი <b>არსებობს</b> შიტში, მაგრამ ზუსტი დამთხვევა არ იყო.\n"
+                "თუ გინდა, შეგიძლია გააგრძელო მონაცემების შევსება.\n"
+                "დააჭირე <b>▶️ სტარტი</b>."
+            ),
+            parse_mode="HTML"
+        )
+        s.stage = "ready_to_start"
+        bot.send_message(chat_id, "გაგრძელება:", reply_markup=kb_start())
         return
 
-    # ყველაფერი რიგზეა -> კითხვარი (მაგალითი 2 კითხვა; ჩაანაცვლე შენი რეალური ბლოკით)
-    s.stage = "questionnaire"
-    s.answers["Q1"] = None
-    s.answers["Q2"] = None
-    bot.send_message(chat_id, "Q1) რამდენი ნომერია სასტუმროში? (რიცხვი)")
+    # match_no ან საერთოდ ვერ იპოვეს → ახალი ჩანაწერის შექმნა
+    bot.edit_message_text(
+        chat_id=chat_id, message_id=call.message.message_id,
+        text="გასაგებია — შევქმნათ ახალი ჩანაწერი.\nდააჭირე <b>▶️ სტარტი</b> რომ გაგრძელდეს.",
+        parse_mode="HTML"
+    )
+    s.stage = "ready_to_start"
+    bot.send_message(chat_id, "გაგრძელება:", reply_markup=kb_start())
 
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "questionnaire" and get_session(m.chat.id).answers.get("Q1") is None)
-def q1(message):
-    s = get_session(message.chat.id)
-    s.answers["Q1"] = message.text.strip()
-    bot.send_message(message.chat.id, "Q2) ვინ არის საკონტაქტო პირი? (სახელი, ტელეფონი)")
-
-@bot.message_handler(func=lambda m: get_session(m.chat.id).stage == "questionnaire" and get_session(m.chat.id).answers.get("Q1") is not None and get_session(m.chat.id).answers.get("Q2") is None)
-def q2(message):
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "ready_to_start" and m.text == "▶️ სტარტი")
+def start_questionnaire(message):
     chat_id = message.chat.id
-    s = get_session(chat_id)
-    s.answers["Q2"] = message.text.strip()
+    s = sess(chat_id)
 
-    # Leads-ში ჩაწერა
-    data = {
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "agent_username": message.from_user.username or f"id:{message.from_user.id}",
-        "hotel_name_en": s.hotel_name_en,
-        "address_ka": s.address_ka,
-        "matched": "YES" if s.best_match else "NO",
-        "decision": "new_lead",
-        "matched_comment": f"name_score={s.best_score_name}, addr_score={s.best_score_addr}",
-        "answers": {
-            "verify_name": s.answers.get("v_name"),
-            "verify_addr": s.answers.get("v_addr"),
-            "Q1": s.answers.get("Q1"),
-            "Q2": s.answers.get("Q2"),
-        }
-    }
+    # უსაფრთხოება — ორივე ველი უნდა გქონდეს შეყვანილი ძებნამდე
+    if not s.hotel_name_en or not s.address_ka:
+        s.stage = "ask_name"
+        bot.send_message(chat_id, "ჯერ შეიყვანე სასტუმროს სახელი ინგლისურად.", parse_mode="HTML")
+        return
+
+    # დამატებითი კონტროლი: თანამშრომელმა იგივე სახელი/მისამართი შეიყვანოს დადასტურებისთვის
+    s.stage = "confirm_fixed"
+    bot.send_message(chat_id, "გაიმეორე სასტუმროს <b>ოფიციალური სახელი (EN)</b> დასადასტურებლად:", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "confirm_fixed" and "fix_name" not in sess(m.chat.id).answers)
+def confirm_name(message):
+    s = sess(message.chat.id)
+    s.answers["fix_name"] = message.text.strip()
+    # შევადაროთ მოძიებულს (თუ იყო) ან პირველ შეყვანილს
+    base = s.best_match.get("hotel name") if s.best_match else s.hotel_name_en
+    if fuzz.token_set_ratio(norm(s.answers["fix_name"]), norm(base)) < 85:
+        bot.send_message(message.chat.id,
+                         "⚠️ შეყვანილი სახელი <b>არ ემთხვევა</b> მოძიებულს/შეყვანილს. გასწორე და კიდევ შეიყვანე.",
+                         parse_mode="HTML")
+        s.answers.pop("fix_name", None)
+        return
+    bot.send_message(message.chat.id, "ახლა ჩაწერე იგივე <b>მისამართი (KA)</b> დასადასტურებლად:", parse_mode="HTML")
+    s.stage = "confirm_fixed_addr"
+
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "confirm_fixed_addr")
+def confirm_addr(message):
+    s = sess(message.chat.id)
+    fix_addr = message.text.strip()
+    base_addr = s.best_match.get("address") if s.best_match else s.address_ka
+    if fuzz.token_set_ratio(norm(fix_addr), norm(base_addr)) < 85:
+        bot.send_message(message.chat.id,
+                         "⚠️ შეყვანილი მისამართი <b>არ ემთხვევა</b> მოძიებულს/შეყვანილს. გასწორე და თავიდან ჩაწერე.",
+                         parse_mode="HTML")
+        return
+
+    # გავაგრძელოთ მინიმალური კითხვარი — (შენს ცხრილში არის: comment, Contact, agent)
+    s.answers["fix_addr"] = fix_addr
+    s.stage = "q_comment"
+    bot.send_message(message.chat.id, "📝 კომენტარი (არასაექსპრესიად, სურვილის მიხედვით — ან ჩაწერე „—“):")
+
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "q_comment")
+def q_comment(message):
+    s = sess(message.chat.id)
+    s.answers["comment"] = message.text.strip()
+    s.stage = "q_contact"
+    bot.send_message(message.chat.id, "☎️ საკონტაქტო ნომერი/სახელი (მაგ.: 555123456 გიორგი):")
+
+@bot.message_handler(func=lambda m: sess(m.chat.id).stage == "q_contact")
+def q_contact(message):
+    chat_id = message.chat.id
+    s = sess(chat_id)
+    s.answers["contact"] = message.text.strip()
+    agent = (message.from_user.username and f"@{message.from_user.username}") or f"id:{message.from_user.id}"
+
+    # ჩავწეროთ იმავე "1 ცხრილი" worksheet-ში ახალ სტრიქონად
     try:
-        append_lead_row(data)
-        bot.send_message(chat_id, "✅ ინფორმაცია წარმატებით ჩაიწერა Google Sheets-ში.", reply_markup=main_menu())
+        append_row_new(
+            hotel_name = s.hotel_name_en,
+            address    = s.address_ka,
+            comment    = s.answers.get("comment","—"),
+            contact    = s.answers.get("contact","—"),
+            agent_name = agent
+        )
+        bot.send_message(chat_id, "✅ ინფორმაცია წარმატებით ჩაიწერა Google Sheet-ში. მადლობა!", reply_markup=kb_main())
     except Exception as e:
-        logger.exception(e)
-        bot.send_message(chat_id, "⚠️ ჩაწერის შეცდომა Google Sheets-ში. გთხოვ სცადე ხელახლა.", reply_markup=main_menu())
+        logger.exception("Append error: %s", e)
+        bot.send_message(chat_id, "⚠️ ჩაწერის შეცდომა Google Sheets-ში. სცადე კიდევ ერთხელ.", reply_markup=kb_main())
 
     SESSIONS[chat_id] = Session(stage="idle")
 
-# --------- fallback
+# fallback
 @bot.message_handler(content_types=['text'])
 def fallback(message):
-    chat_id = message.chat.id
-    s = get_session(chat_id)
+    s = sess(message.chat.id)
     if s.stage == "idle":
-        bot.send_message(chat_id, "აირჩიე მოქმედება მენიუდან 👇", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "აირჩიე მოქმედება მენიუდან.", reply_markup=kb_main())
     else:
-        bot.send_message(chat_id, "გთხოვ, მიჰყევი ინსტრუქციას ან დაბრუნდი უკან.", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "გაგვიზიარე მოსალოდნელი ინფორმაცია ან დაბრუნდი მენიუში.", reply_markup=kb_main())
 
-# -------------------- Flask routes ---------------
+# -------------------- Flask routes -----------------
 @app.route("/", methods=["GET"])
 def health():
-    return "OK TV HotelClaimBot — alive", 200
+    return "HotelClaimBot — alive", 200
 
-# ორი მისამართი მივიღოთ (BOT_TOKEN და /webhook/BOT_TOKEN)
+# ვებუქი — მხოლოდ ერთი მისამართი, რომ 429 აღარ დაგივარდეს
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     if request.headers.get('content-type') == 'application/json':
         update = telebot.types.Update.de_json(request.data.decode("utf-8"))
@@ -432,28 +382,16 @@ def telegram_webhook():
         return "OK", 200
     abort(403)
 
-# -------------------- Webhook setup --------------
+# -------------------- Webhook რეგისტრაცია ----------
 def set_webhook():
     try:
-        url_plain   = f"{APP_BASE_URL}/{TELEGRAM_TOKEN}"
-        url_webhook = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+        url = f"{APP_BASE_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
         bot.remove_webhook()
         time.sleep(1.0)
-        ok1 = bot.set_webhook(url=url_plain, max_connections=4, allowed_updates=["message", "callback_query"])
-        ok2 = bot.set_webhook(url=url_webhook, max_connections=4, allowed_updates=["message", "callback_query"])
-        logger.info(f"Webhook set to {url_plain}: {ok1} | {url_webhook}: {ok2}")
+        ok = bot.set_webhook(url=url, max_connections=5, allowed_updates=["message", "callback_query"])
+        logger.info(f"Webhook set to {url}: {ok}")
     except Exception as e:
         logger.exception("Failed to set webhook: %s", e)
 
-# გაშვებისას ერთხელ მოვახდინოთ რეგისტრაცია
+# gunicorn-ის წამოდგომისას ერთხელ გაეშვას
 set_webhook()
-
-# gunicorn აგრძნობს `app`
-# Start command on Render:
-#   gunicorn telegram_hotel_booking_bot:app --bind 0.0.0.0:$PORT --timeout 120
-try:
-    bot.remove_webhook()
-    time.sleep(2)
-    bot.set_webhook(url=url_webhook)
-except Exception as e:
-    print(f"Webhook set error: {e}")
