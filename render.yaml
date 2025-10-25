@@ -1,7 +1,15 @@
 services:
   - type: web
-    name: ok-tv-bot
+    name: ok-tv-1
     env: python
-    plan: standard
-    buildCommand: pip install -r requirements.txt
+    buildCommand: ""
     startCommand: gunicorn telegram_hotel_booking_bot:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
