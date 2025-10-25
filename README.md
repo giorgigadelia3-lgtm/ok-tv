@@ -1,16 +1,15 @@
-# HotelClaimBot (Render + Telegram Webhook)
+# OK-TV Telegram Bot (Webhook + Google Sheets)
 
-ENV:
+Env ცვლადები Render-ზე:
 - TELEGRAM_TOKEN
-- APP_BASE_URL (e.g. https://ok-tv-1.onrender.com)
-- SPREADSHEET_ID
-- GOOGLE_SERVICE_ACCOUNT_JSON
-- SHEET_NAME (optional, default "Hotels")
+- APP_BASE_URL           # напр.: https://ok-tv-1.onrender.com
+- SPREADSHEET_ID         # თქვენი Google Sheet-ის ID
+- GOOGLE_SERVICE_ACCOUNT_JSON  # Service Account JSON მთლიანად (როგორც Text secret)
 
-Routes:
-- GET /           -> health check
-- POST /<TOKEN>   -> telegram webhook endpoint
+Deploy:
+- `requirements.txt` + `Procfile`
+- Start Command: `gunicorn telegram_hotel_booking_bot:app --bind 0.0.0.0:$PORT --timeout 120`
 
-Buttons:
-- "🔎 მოძებნა"  -> ჯერ სასტუმროს სახელი (EN), შემდეგ მისამართი (KA), მოძებნა Google Sheet-ში, fuzzy match-ით.
-- "▶️ სტარტი"   -> (თუ არ მოიძებნა) იწყებს კითხვარს და ახალ ჩანაწერს წერს Sheet-ში.
+Webhook:
+- აპი ავტომატურად დააყენებს ვებჰუქს APP_BASE_URL + `/webhook/<TOKEN>`
+
