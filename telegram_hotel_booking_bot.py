@@ -1,11 +1,16 @@
 import os
 import json
 import logging
+import threading
 import asyncio
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+
+from fuzzywuzzy import fuzz, process
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 from telegram import (
     Update,
@@ -14,373 +19,525 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
+    ConversationHandler,
     CallbackQueryHandler,
     filters,
 )
-from rapidfuzz import fuzz, process
-import gspread
-from google.oauth2.service_account import Credentials
 
-# ---------------- Logging ----------------
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s]: %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s", level=logging.INFO
 )
 log = logging.getLogger("hotel_bot")
 
-# ---------------- Env ----------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")  # https://ok-tv-1.onrender.com
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-SHEET_NAME = os.environ.get("SHEET_NAME", "Hotels")  # შეგიძლია შეცვალო სურვილისამებრ
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-if not (TELEGRAM_TOKEN and APP_BASE_URL and SPREADSHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
-    log.warning("Some env vars are missing. Make sure TELEGRAM_TOKEN, APP_BASE_URL, SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON are set.")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_TOKEN env")
+if not APP_BASE_URL:
+    raise RuntimeError("Missing APP_BASE_URL env")
+if not SPREADSHEET_ID:
+    raise RuntimeError("Missing SPREADSHEET_ID env")
+if not GOOGLE_SA_JSON:
+    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env")
 
-# ---------------- Flask ----------------
+# =========================
+# Flask
+# =========================
 app = Flask(__name__)
 
-# ---------------- Google Sheets helper ----------------
-def _sheet_client():
-    """Authorize and return (gc, worksheet)"""
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+# =========================
+# Google Sheets helper
+# =========================
+
+SCOPE = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def _sa_client():
+    data = json.loads(GOOGLE_SA_JSON)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(data, scopes=SCOPE)
     gc = gspread.authorize(creds)
+    return gc
+
+def open_sheet():
+    gc = _sa_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    try:
-        ws = sh.worksheet(SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        # შევქმნათ default სქემა
-        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
-        ws.append_row(["Name_EN", "Address_KA", "Status", "Comment", "CreatedBy", "CreatedAt"])
+    # პირველი worksheet — შეგიძლია შეცვალო სახელით თუ გჭირდება
+    ws = sh.sheet1
     return ws
 
-def _read_hotels() -> List[Dict[str, str]]:
-    ws = _sheet_client()
-    rows = ws.get_all_records()
-    # normalize headers
+# ვიგულვოთ სვეტების სტრუქტურა:
+# A: Hotel Name (EN)
+# B: Address (KA)
+# C: Status  (e.g., ✅ Surveyed / ❌ Already / NEW)
+# D: Comment
+# E+: სხვა ველები (ჩასაწერი ბოტიდან როცა ახალია)
+
+def read_all_hotels() -> List[Dict[str, Any]]:
+    ws = open_sheet()
+    values = ws.get_all_records()
+    # მოამზადე სტანდარტული ფორმატი
     normalized = []
-    for r in rows:
+    for row in values:
         normalized.append({
-            "Name_EN": str(r.get("Name_EN", "")).strip(),
-            "Address_KA": str(r.get("Address_KA", "")).strip(),
-            "Status": str(r.get("Status", "")).strip(),
-            "Comment": str(r.get("Comment", "")).strip(),
+            "name": str(row.get("Hotel Name", "")).strip(),
+            "address": str(row.get("Address", "")).strip(),
+            "status": str(row.get("Status", "")).strip(),
+            "comment": str(row.get("Comment", "")).strip(),
+            "_raw": row,
         })
     return normalized
 
-def _append_hotel(name_en: str, address_ka: str, status: str, comment: str, user: str):
-    ws = _sheet_client()
-    from datetime import datetime
-    ws.append_row([name_en, address_ka, status, comment, user, datetime.utcnow().isoformat(timespec="seconds") + "Z"])
+def append_new_row(payload: Dict[str, Any]) -> None:
+    ws = open_sheet()
+    # აკურატულად შეავსე — თუ გაგაჩნია სხვა სვეტებიც, დაამატე აქ
+    ws.append_row(
+        [
+            payload.get("name", ""),
+            payload.get("address", ""),
+            payload.get("status", "NEW"),
+            payload.get("comment", ""),
+            payload.get("contact_name", ""),
+            payload.get("contact_phone", ""),
+            payload.get("notes", ""),
+        ],
+        value_input_option="USER_ENTERED",
+    )
 
-# ---------------- Fuzzy match ----------------
-@dataclass
-class MatchResult:
-    found_exact: bool = False
-    exact_row: Optional[Dict[str, str]] = None
-    suggestions: List[Tuple[Dict[str,str], int]] = field(default_factory=list)  # (row, score)
+# =========================
+# Helpers
+# =========================
 
-def find_hotel(name_en: str, address_ka: str) -> MatchResult:
-    hotels = _read_hotels()
-    result = MatchResult()
-    # Try exact-ish first
+def normalize(s: str) -> str:
+    return " ".join(s.lower().strip().split())
+
+def best_matches(
+    hotels: List[Dict[str, Any]], name: str, address: str, limit: int = 5
+) -> List[Tuple[Dict[str, Any], int]]:
+    """
+    აბრუნებს საუკეთესო მსგავსებებს name + address-ზე დაყრდნობით.
+    ქულა = საშუალო(token_set_ratio(name), token_set_ratio(address))
+    """
+    res = []
     for h in hotels:
-        if h["Name_EN"].lower() == name_en.lower() and h["Address_KA"] == address_ka:
-            result.found_exact = True
-            result.exact_row = h
-            return result
+        nscore = fuzz.token_set_ratio(normalize(name), normalize(h["name"]))
+        ascore = fuzz.token_set_ratio(normalize(address), normalize(h["address"]))
+        score = (nscore + ascore) // 2
+        res.append((h, score))
+    res.sort(key=lambda x: x[1], reverse=True)
+    return res[:limit]
 
-    # Fuzzy: combine name/address
-    candidates = []
-    for h in hotels:
-        name_score = fuzz.WRatio(name_en.lower(), h["Name_EN"].lower())
-        addr_score = fuzz.WRatio(address_ka, h["Address_KA"])
-        combined = int(0.65 * name_score + 0.35 * addr_score)  # name heavier
-        if combined >= 80:
-            candidates.append((h, combined))
+def is_strong_match(score: int) -> bool:
+    # 90%-ზე მეტი — ვთვლით ზუსტ ან თითქმის ზუსტ დამთხვევად
+    return score >= 90
 
-    # Sort by score desc
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    result.suggestions = candidates[:5]
-    return result
+def is_close_match(score: int) -> bool:
+    # ახლოსაა, მაგრამ არა აბსოლუტურად ზუსტი
+    return score >= 70
 
-# ---------------- Conversation state (simple FSM via user_data) ----------------
-SEARCH_BTN = "🔎 მოძებნა"
-START_BTN  = "▶️ სტარტი"
-
-ASK_NAME = "ASK_NAME"
-ASK_ADDR = "ASK_ADDR"
-WAIT_CONFIRM_SUGGEST = "WAIT_CONFIRM_SUGGEST"
-FILL_FLOW = "FILL_FLOW"
-CONFIRM_NAME = "CONFIRM_NAME"
-CONFIRM_ADDR = "CONFIRM_ADDR"
-
-# აქ ჩამოწერე შენი საბოლოო კითხვარი – 1:1 შეცვლადი სიით.
-QUESTIONS: List[Tuple[str, str]] = [
-    # (key, prompt)
-    ("contact_person", "კონტაქტი (სახელი გვარი):"),
-    ("phone", "ტელეფონის ნომერი:"),
-    ("notes", "დამატებითი შენიშვნა:"),
-]
-
-def home_keyboard() -> ReplyKeyboardMarkup:
+def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(SEARCH_BTN)], [KeyboardButton(START_BTN)]],
-        resize_keyboard=True
+        [
+            [KeyboardButton("🔎 მოძებნა"), KeyboardButton("▶️ Start")],
+            [KeyboardButton("ℹ️ დახმარება")],
+        ],
+        resize_keyboard=True,
     )
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "გამარჯობა! აირჩიე ქმედება 👇",
-        reply_markup=home_keyboard()
-    )
-    context.user_data.clear()
+def red_x() -> str:
+    return "❌"
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+def green_check() -> str:
+    return "✅"
 
-    # 1) საწყისი მენიუ
-    if text == SEARCH_BTN:
-        context.user_data.clear()
-        context.user_data["mode"] = "search"
-        await update.message.reply_text("სასტუმროს ოფიციალური სახელი შეიყვანე ინგლისურად:")
-        context.user_data["step"] = ASK_NAME
-        return
+# =========================
+# Conversation states
+# =========================
 
-    if text == START_BTN:
-        # თუ უკვე გვაქ სახელ/მისამართი ძიებიდან და არ იყო გამოკითხული -> გადავამოწმოთ შესაბამისობა
-        mode = context.user_data.get("mode")
-        if mode == "search_not_found":
-            await update.message.reply_text(
-                "ახლა კიდევ ერთხელ შეიყვანე იგივე სასტუმროს ოფიციალური სახელი (EN):"
-            )
-            context.user_data["step"] = CONFIRM_NAME
-            return
-        # თორემ პირდაპირ დავიწყოთ სვლა ნულიდან
-        await start_fill_flow(update, context)
-        return
+# Search flow
+S_NAME, S_ADDR, S_CONFIRM = range(3)
 
-    # 2) Search flow
-    step = context.user_data.get("step")
-    if step == ASK_NAME:
-        context.user_data["hotel_name_en"] = text
-        await update.message.reply_text("ახლა იგივე სასტუმროს ოფიციალური მისამართი ჩაწერე ქართულად:")
-        context.user_data["step"] = ASK_ADDR
-        return
+# New (Start) flow
+N_NAME, N_ADDR, N_CONTACT, N_PHONE, N_NOTES, N_CONFIRM = range(6)
 
-    if step == ASK_ADDR:
-        context.user_data["hotel_addr_ka"] = text
-        name_en = context.user_data["hotel_name_en"]
-        addr_ka = context.user_data["hotel_addr_ka"]
+# =========================
+# PTB Application — background loop
+# =========================
 
-        mr = find_hotel(name_en, addr_ka)
-        # ზუსტად მოიძებნა
-        if mr.found_exact and mr.exact_row:
-            row = mr.exact_row
-            comment = row.get("Comment", "")
-            await update.message.reply_text(
-                "ეს სასტუმრო უკვე გვაქვს გამოკითხული. ვანიშნავ სტატუსს ❌\n"
-                f"კომენტარი: {comment or '—'}\n\nჩატი დასრულებულია.",
-                reply_markup=home_keyboard()
-            )
-            context.user_data.clear()
-            return
-
-        # ზუსტი არა, მაგრამ მსგავსები მოიძებნა
-        if mr.suggestions:
-            # შევთავაზოთ
-            buttons = []
-            for i, (row, score) in enumerate(mr.suggestions, start=1):
-                n = row.get("Name_EN","")
-                a = row.get("Address_KA","")
-                buttons.append([InlineKeyboardButton(f"{i}) {n} | {a} (≈{score}%)", callback_data=f"suggest:{i-1}")])
-            buttons.append([InlineKeyboardButton("ვერ ვპოულობ – გავაგრძელოთ ახალი ჩანაწერი", callback_data="suggest:none")])
-            await update.message.reply_text(
-                "მსგავსი ჩანაწერები ვიპოვე – რომელს გულისხმობ? (შეამოწმე მართლწერა)\n"
-                "თუ არცერთი არ არის, აირჩიე ბოლო ვარიანტი:",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-            context.user_data["suggestions"] = mr.suggestions
-            context.user_data["step"] = WAIT_CONFIRM_SUGGEST
-            return
-
-        # საერთოდ ვერ ვიპოვეთ – მივცეთ გაგრძელების უფლება
-        await update.message.reply_text(
-            "ეს სასტუმრო ბაზაში ვერ ვიპოვე. შეგიძლია დაუკავშირდე სასტუმროს "
-            "ან ახალი ჩანაწერი შექმნა — დააჭირე „▶️ სტარტი“.",
-            reply_markup=home_keyboard()
-        )
-        context.user_data["mode"] = "search_not_found"
-        return
-
-    # 3) ძიების შემდეგ დასტური – სახელი/მისამართი შევადაროთ
-    if step == CONFIRM_NAME:
-        entered_name = text
-        found_name = context.user_data.get("hotel_name_en","")
-        if fuzz.WRatio(entered_name.lower(), found_name.lower()) < 90:
-            await update.message.reply_text(
-                "შეყვანილი სახელი არ ემთხვევა საძიებო ეტაპზე შეყვანილს. "
-                "გთხოვ, გაასწორე და ზუსტად ჩაწერე (EN):"
-            )
-            return
-        context.user_data["hotel_name_en"] = entered_name
-        await update.message.reply_text("კარგი. ახლა მისამართი (KA):")
-        context.user_data["step"] = CONFIRM_ADDR
-        return
-
-    if step == CONFIRM_ADDR:
-        entered_addr = text
-        found_addr = context.user_data.get("hotel_addr_ka","")
-        if fuzz.WRatio(entered_addr, found_addr) < 90:
-            await update.message.reply_text(
-                "მისამართი არ ემთხვევა საძიებო ეტაპზე შეყვანილს. "
-                "გთხოვ, გადაამოწმე და ზუსტად ჩაწერე ქართული მისამართი:"
-            )
-            return
-        context.user_data["hotel_addr_ka"] = entered_addr
-        # გადავიდეთ შეკითხვებზე
-        await start_fill_flow(update, context)
-        return
-
-    # 4) კითხვარის პერიოდში პასუხები
-    if step == FILL_FLOW:
-        q_index = context.user_data.get("q_index", 0)
-        key, _prompt = QUESTIONS[q_index]
-        context.user_data.setdefault("answers", {})[key] = text
-
-        q_index += 1
-        if q_index >= len(QUESTIONS):
-            # ვწერთ შიტში ახალ ჩანაწერს ✅
-            name_en = context.user_data.get("hotel_name_en", "")
-            addr_ka = context.user_data.get("hotel_addr_ka", "")
-            comment = context.user_data["answers"].get("notes", "")
-            # ახალზე – სტატუსად ✅ გამოვიყენოთ (ან ცარიელი)
-            _append_hotel(
-                name_en=name_en,
-                address_ka=addr_ka,
-                status="✅ NEW",
-                comment=comment,
-                user=update.effective_user.full_name if update.effective_user else "unknown",
-            )
-            await update.message.reply_text(
-                "ინფორმაცია წარმატებით ჩაიწერა Google Sheet-ში. მადლობა!\nჩატი დასრულებულია.",
-                reply_markup=home_keyboard()
-            )
-            context.user_data.clear()
-            return
-        else:
-            context.user_data["q_index"] = q_index
-            key, prompt = QUESTIONS[q_index]
-            await update.message.reply_text(prompt)
-            return
-
-    # სხვა ტექსტი – საწყისისკენ
-    await update.message.reply_text("აირჩიე 👇", reply_markup=home_keyboard())
-
-
-async def start_fill_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["step"] = FILL_FLOW
-    context.user_data["q_index"] = 0
-    context.user_data.setdefault("answers", {})
-    # თუ search-ით არ მოსულა, ახლა ვთხოვოთ აუცილებელი ორი ველი:
-    if "hotel_name_en" not in context.user_data or "hotel_addr_ka" not in context.user_data:
-        await update.message.reply_text("ჯერ სასტუმროს ოფიციალური სახელი (EN) ჩაწერე:")
-        context.user_data["step"] = ASK_NAME
-        return
-    # თორემ პირდაპირ პირველ შეკითხვაზე გადავიდეთ
-    first_prompt = QUESTIONS[0][1]
-    await update.message.reply_text(first_prompt)
-
-# ---------------- Callbacks ----------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-
-    if data.startswith("suggest:"):
-        val = data.split(":",1)[1]
-        if val == "none":
-            # ახალი ჩანაწერის გზა
-            await query.edit_message_text(
-                "არცერთი არ არის. შეგიძლია ახალი ჩანაწერი დაიწყო – დააჭირე „▶️ სტარტი“."
-            )
-            context.user_data["mode"] = "search_not_found"
-            return
-        try:
-            idx = int(val)
-        except ValueError:
-            return
-        suggestions = context.user_data.get("suggestions", [])
-        if not suggestions or idx >= len(suggestions):
-            return
-        row, score = suggestions[idx]
-        # ეს უკვე ბაზაშია – დავასრულოთ
-        comment = row.get("Comment","")
-        await query.edit_message_text(
-            "ეს სასტუმრო უკვე გამოკითხულია. სტატუსი: ❌\n"
-            f"კომენტარი: {comment or '—'}\n\nჩატი დასრულებულია."
-        )
-        context.user_data.clear()
-        return
-
-# ---------------- Telegram app bootstrap ----------------
-tg_app: Optional[Application] = None
-loop = asyncio.get_event_loop()
+application: Application
+loop: asyncio.AbstractEventLoop
+_app_ready = threading.Event()
 
 async def _build_and_start_application():
-    global tg_app
-    tg_app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .concurrent_updates(True)
-        .build()
+    global application
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # --- Handlers registration ---
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(MessageHandler(filters.Regex("^ℹ️ დახმარება$"), help_cmd))
+    application.add_handler(MessageHandler(filters.Regex("^🔎 მოძებნა$"), search_entry))
+    application.add_handler(MessageHandler(filters.Regex("^▶️ Start$"), new_entry))
+
+    # Search conversation
+    application.add_handler(
+        ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex("^🔎 მოძებნა$"), search_entry)],
+            states={
+                S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_name)],
+                S_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_addr)],
+                S_CONFIRM: [
+                    CallbackQueryHandler(search_pick_suggestion, pattern=r"^pick_\d+$"),
+                    CallbackQueryHandler(search_decline_suggestions, pattern=r"^pick_none$"),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_any)],
+            name="search_conv",
+            persistent=False,
+        )
     )
 
-    # Handlers
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CallbackQueryHandler(on_callback))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # Set webhook (masked in logs)
-    webhook_url = f"{APP_BASE_URL}/{TELEGRAM_TOKEN}"
-    ok = await tg_app.bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=["message","callback_query"]
+    # New / Start conversation
+    application.add_handler(
+        ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex("^▶️ Start$"), new_entry)],
+            states={
+                N_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_name)],
+                N_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_addr)],
+                N_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_contact)],
+                N_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_phone)],
+                N_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_notes)],
+                N_CONFIRM: [
+                    CallbackQueryHandler(new_confirm_yes, pattern=r"^new_ok$"),
+                    CallbackQueryHandler(new_confirm_no, pattern=r"^new_cancel$"),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_any)],
+            name="new_conv",
+            persistent=False,
+        )
     )
-    log.info("Webhook set (masked): %s/*** -> %s", APP_BASE_URL, ok)
 
-    await tg_app.initialize()
-    await tg_app.start()
+    # Default fallbacks
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
+    application.add_handler(MessageHandler(filters.ALL, fallback_router))
 
-# Kick off the telegram application in background
-loop.create_task(_build_and_start_application())
+    # --- Start bot internal services (without polling) ---
+    await application.initialize()
+    await application.start()
+    _app_ready.set()
+    log.info("Telegram application started")
 
-# ---------------- Flask routes ----------------
-@app.route("/", methods=["GET"])
-def health():
-    return "OK"
+def start_background_loop():
+    global loop
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: loop.run_until_complete(_build_and_start_application()), daemon=True).start()
+    _app_ready.wait()
 
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    if request.method == "POST":
-        try:
-            update = Update.de_json(request.get_json(force=True), tg_app.bot)
-            # put update into PTB queue
-            tg_app.update_queue.put_nowait(update)
-        except Exception as e:
-            log.exception("webhook error: %s", e)
-            return jsonify({"ok": False}), 500
-        return jsonify({"ok": True})
-    return "Method Not Allowed", 405
+start_background_loop()
+
+# =========================
+# Bot handlers
+# =========================
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        "გამარჯობა! აირჩიე მოქმედება 👇",
+        reply_markup=main_menu(),
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        "🔎 *მოძებნა* — ჯერ შეიყვანე სასტუმროს ოფიციალური სახელი (ინგლisch), შემდეგ მისი მისამართი (ქართული). "
+        "ბოტი შეადარებს Sheets-ში არსებულ მონაცემებს და გეტყვის უკვე გამოკითხულია თუ არა.\n\n"
+        "▶️ *Start* — დაიწყო ახალ ობიექტზე შეკითხვები და შედეგი ჩაიწერება Sheet-ში.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
+
+async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("ბრძანება ვერ გავიგე. აირჩიე მენიუდან ⬇️", reply_markup=main_menu())
+
+async def fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # თუ ტექსტი მოვიდა უშუალოდ — გადამისამართე მენიუზე
+    await update.effective_message.reply_text("აირჩიე მოქმედება ⬇️", reply_markup=main_menu())
+
+# ----- SEARCH FLOW -----
+
+async def search_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "მომეცი *სასტუმროს ოფიციალური სახელი (EN)* — მაგალითად: `Radisson Blu Iveria`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return S_NAME
+
+async def search_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_message.text.strip()
+    context.user_data["search_name_en"] = name
+    await update.effective_message.reply_text(
+        "ახლა მომეცი *სასტუმროს ოფიციალური მისამართი ქართულად* — მაგ.: `თბილისი, კოსტავას 14`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return S_ADDR
+
+async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = update.effective_message.text.strip()
+    context.user_data["search_addr_ka"] = addr
+
+    # მოძებნე Sheet-ში
+    hotels = read_all_hotels()
+    matches = best_matches(hotels, context.user_data["search_name_en"], addr, limit=5)
+
+    if not matches:
+        await update.effective_message.reply_text(
+            "ვერ ვიპოვე მსგავსი ჩანაწერი Sheet-ში. შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+        # შევინახოთ მოკლე „მოლოდინები“ რათა Start-ზე შევადაროთ
+        context.user_data["expected_name"] = context.user_data["search_name_en"]
+        context.user_data["expected_addr"] = context.user_data["search_addr_ka"]
+        return ConversationHandler.END
+
+    # თუ ძალიან ძლიერი დამთხვევაა — მიგვაჩნია, რომ უკვე არსებობს
+    best_hotel, score = matches[0]
+    if is_strong_match(score):
+        comment = best_hotel.get("comment") or "კომენტარი არ არის."
+        await update.effective_message.reply_text(
+            f"{red_x()} *სასტუმრო უკვე გამოკითხულია.*\n\n"
+            f"*სახელი:* {best_hotel['name']}\n"
+            f"*მისამართი:* {best_hotel['address']}\n"
+            f"*კომენტარი:* _{comment}_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+        return ConversationHandler.END
+
+    # სხვა შემთხვევაში — შევთავაზოთ „ეს ხომ არ არის?“ ვარიანტები
+    buttons = []
+    text_lines = ["შეიძლება इनमें ერთ-ერთს გულისხმობდე?"]
+    for idx, (h, sc) in enumerate(matches, start=1):
+        text_lines.append(f"{idx}) {h['name']} — {h['address']} (სიმსგავსე {sc}%)")
+        buttons.append(
+            [InlineKeyboardButton(f"{idx}) აირჩიე", callback_data=f"pick_{idx-1}")]
+        )
+    buttons.append([InlineKeyboardButton("არაფერი არ ემთხვევა", callback_data="pick_none")])
+
+    context.user_data["search_suggestions"] = matches
+
+    await update.effective_message.reply_text(
+        "\n".join(text_lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return S_CONFIRM
+
+async def search_pick_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split("_")[1])
+    matches: List[Tuple[Dict[str, Any], int]] = context.user_data.get("search_suggestions", [])
+    if idx < 0 or idx >= len(matches):
+        await q.edit_message_text("არასწორი არჩევანი.")
+        return ConversationHandler.END
+
+    hotel, score = matches[idx]
+    comment = hotel.get("comment") or "კომენტარი არ არის."
+
+    await q.edit_message_text(
+        f"{red_x()} *სასტუმრო უკვე გამოკითხულია.*\n\n"
+        f"*სახელი:* {hotel['name']}\n"
+        f"*მისამართი:* {hotel['address']}\n"
+        f"*კომენტარი:* _{comment}_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    # დასრულება — ჩატი ავტომატურად მთავრდება „უკვე გამოკითხულია“ შემთხვევაში
+    return ConversationHandler.END
+
+async def search_decline_suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    # შევინახოთ რომ „ვარიანტები არ ემთხვეოდა“ — და მივცეთ Start
+    context.user_data["expected_name"] = context.user_data.get("search_name_en")
+    context.user_data["expected_addr"] = context.user_data.get("search_addr_ka")
+
+    await q.edit_message_text(
+        "ოკ! მაშინ შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით და შევავსოთ ახალი ჩანაწერი.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+# ----- NEW / START FLOW -----
+
+async def new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "დავიწყოთ ახალი ჩანაწერი.\n\n"
+        "გთხოვ, ისევ შეიყვანე *სასტუმროს ოფიციალური სახელი (EN)*:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return N_NAME
+
+async def new_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_message.text.strip()
+    context.user_data["new_name"] = name
+
+    # თუ Search-იდან იყო მოლოდინი — შევადაროთ
+    exp = context.user_data.get("expected_name")
+    if exp and normalize(exp) != normalize(name):
+        await update.effective_message.reply_text(
+            f"ℹ️ შენ მიერ შეყვანილი სახელი ({name}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
+            "დარწმუნდე, რომ სწორად წერ. თუ ყველაფერი სწორია, გავაგრძელოთ.",
+        )
+
+    await update.effective_message.reply_text(
+        "ახლა შეიყვანე *სასტუმროს ოფიციალური მისამართი ქართულად*:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return N_ADDR
+
+async def new_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = update.effective_message.text.strip()
+    context.user_data["new_addr"] = addr
+
+    exp = context.user_data.get("expected_addr")
+    if exp and normalize(exp) != normalize(addr):
+        await update.effective_message.reply_text(
+            f"ℹ️ შენ მიერ შეყვანილი მისამართი ({addr}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
+            "გთხოვ გადაამოწმე. თუ სწორია, გავაგრძელოთ.",
+        )
+
+    await update.effective_message.reply_text("კონტაქტის სახელი (ვინ გვპასუხობს?):")
+    return N_CONTACT
+
+async def new_collect_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["contact_name"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text("კონტაქტის ტელეფონი:")
+    return N_PHONE
+
+async def new_collect_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["contact_phone"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text("შენიშვნები / კომენტარი:")
+    return N_NOTES
+
+async def new_collect_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["notes"] = update.effective_message.text.strip()
+
+    name = context.user_data["new_name"]
+    addr = context.user_data["new_addr"]
+    contact = context.user_data.get("contact_name", "")
+    phone = context.user_data.get("contact_phone", "")
+    notes = context.user_data.get("notes", "")
+
+    preview = (
+        f"*შესაჯამებელი:*\n"
+        f"• სახელი (EN): {name}\n"
+        f"• მისამართი (KA): {addr}\n"
+        f"• კონტაქტი: {contact} | {phone}\n"
+        f"• შენიშვნა: {notes}\n\n"
+        "დავადასტუროთ ჩაწერა Sheet-ში?"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ დადასტურება", callback_data="new_ok")],
+            [InlineKeyboardButton("❌ გაუქმება", callback_data="new_cancel")],
+        ]
+    )
+    await update.effective_message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    return N_CONFIRM
+
+async def new_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    payload = {
+        "name": context.user_data["new_name"],
+        "address": context.user_data["new_addr"],
+        "status": "NEW",
+        "comment": context.user_data.get("notes", ""),
+        "contact_name": context.user_data.get("contact_name", ""),
+        "contact_phone": context.user_data.get("contact_phone", ""),
+        "notes": context.user_data.get("notes", ""),
+    }
+    append_new_row(payload)
+
+    await q.edit_message_text(
+        f"{green_check()} ჩანაწერი წარმატებით ჩაიწერა Sheet-ში. გმადლობთ!",
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def new_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("გაუქმებულია.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text("გაუქმებულია.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+# =========================
+# Flask routes
+# =========================
+
+@app.get("/")
+def health() -> Response:
+    return Response("OK", status=200)
+
+@app.get("/set_webhook")
+def set_webhook():
+    url = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+    async def _do():
+        await application.bot.set_webhook(url=url, drop_pending_updates=True)
+    fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+    fut.result(timeout=15)
+    log.info("Webhook set (masked): %s/*** -> True", APP_BASE_URL)
+    return jsonify(ok=True, url=url)
+
+@app.post(f"/webhook/{TELEGRAM_TOKEN}")
+def telegram_webhook():
+    # მიიღე update და გადააწოდე PTB-ს
+    update_json = request.get_json(force=True, silent=True)
+    if not update_json:
+        return jsonify(ok=False)
+    update = Update.de_json(update_json, application.bot)
+
+    async def _process():
+        await application.process_update(update)
+
+    asyncio.run_coroutine_threadsafe(_process(), loop)
+    return jsonify(ok=True)
+
+# აპის გაშვებისას ერთი ჯერ მოვახდინოთ webhook-ის დაყენება
+with app.app_context():
+    try:
+        url = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+        async def _do():
+            await application.bot.set_webhook(url=url, drop_pending_updates=True)
+        fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+        fut.result(timeout=20)
+        log.info("Webhook set (masked): %s/*** -> True", APP_BASE_URL)
+    except Exception as e:
+        log.warning("Webhook set failed initially: %s", e)
+
+# =========================
+# End of file
+# =========================
