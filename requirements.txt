@@ -1,6 +1,7 @@
-Flask==2.3.3
-pyTelegramBotAPI==4.22.1
-gspread==6.1.4
-google-auth==2.35.0
-rapidfuzz==3.9.7
-gunicorn==23.0.0
+flask
+gunicorn
+python-telegram-bot==20.7
+gspread
+google-auth
+rapidfuzz
+pytz
