@@ -35,7 +35,8 @@ from telegram.ext import (
 # Logging
 # =========================
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s", level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
+    level=logging.INFO,
 )
 log = logging.getLogger("hotel_bot")
 
@@ -70,18 +71,20 @@ SCOPE = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+
 def _sa_client():
     data = json.loads(GOOGLE_SA_JSON)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(data, scopes=SCOPE)
     gc = gspread.authorize(creds)
     return gc
 
+
 def open_sheet():
     gc = _sa_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    # პირველი worksheet — სურვილისამებრ შეგიძლია შეცვალო სახელით
-    ws = sh.sheet1
+    ws = sh.sheet1  # შეცვალე თუ გჭირდება სხვა worksheet
     return ws
+
 
 # ვიგულვოთ სვეტების სტრუქტურა:
 # A: Hotel Name (EN)
@@ -91,20 +94,22 @@ def open_sheet():
 # E: Contact Name
 # F: Contact Phone
 # G: Notes
-
 def read_all_hotels() -> List[Dict[str, Any]]:
     ws = open_sheet()
     values = ws.get_all_records()
     normalized = []
     for row in values:
-        normalized.append({
-            "name": str(row.get("Hotel Name", "")).strip(),
-            "address": str(row.get("Address", "")).strip(),
-            "status": str(row.get("Status", "")).strip(),
-            "comment": str(row.get("Comment", "")).strip(),
-            "_raw": row,
-        })
+        normalized.append(
+            {
+                "name": str(row.get("Hotel Name", "")).strip(),
+                "address": str(row.get("Address", "")).strip(),
+                "status": str(row.get("Status", "")).strip(),
+                "comment": str(row.get("Comment", "")).strip(),
+                "_raw": row,
+            }
+        )
     return normalized
+
 
 def append_new_row(payload: Dict[str, Any]) -> None:
     ws = open_sheet()
@@ -121,12 +126,13 @@ def append_new_row(payload: Dict[str, Any]) -> None:
         value_input_option="USER_ENTERED",
     )
 
+
 # =========================
 # Helpers
 # =========================
-
 def normalize(s: str) -> str:
     return " ".join(s.lower().strip().split())
+
 
 def best_matches(
     hotels: List[Dict[str, Any]], name: str, address: str, limit: int = 5
@@ -144,11 +150,10 @@ def best_matches(
     res.sort(key=lambda x: x[1], reverse=True)
     return res[:limit]
 
+
 def is_strong_match(score: int) -> bool:
     return score >= 90
 
-def is_close_match(score: int) -> bool:
-    return score >= 70
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -159,11 +164,14 @@ def main_menu() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
+
 def red_x() -> str:
     return "❌"
 
+
 def green_check() -> str:
     return "✅"
+
 
 # =========================
 # Conversation states
@@ -176,12 +184,13 @@ S_NAME, S_ADDR, S_CONFIRM = range(3)
 N_NAME, N_ADDR, N_CONTACT, N_PHONE, N_NOTES, N_CONFIRM = range(6)
 
 # =========================
-# PTB Application (will be started later)
+# PTB Application (background)
 # =========================
-
 application: Application
 loop: asyncio.AbstractEventLoop
 _app_ready = threading.Event()
+_started_webhook_once = False
+
 
 async def _build_and_start_application():
     """Build & start PTB application in background loop."""
@@ -199,11 +208,19 @@ async def _build_and_start_application():
         ConversationHandler(
             entry_points=[MessageHandler(filters.Regex("^🔎 მოძებნა$"), search_entry)],
             states={
-                S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_name)],
-                S_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_addr)],
+                S_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_name)
+                ],
+                S_ADDR: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, search_collect_addr)
+                ],
                 S_CONFIRM: [
-                    CallbackQueryHandler(search_pick_suggestion, pattern=r"^pick_\d+$"),
-                    CallbackQueryHandler(search_decline_suggestions, pattern=r"^pick_none$"),
+                    CallbackQueryHandler(
+                        search_pick_suggestion, pattern=r"^pick_\d+$"
+                    ),
+                    CallbackQueryHandler(
+                        search_decline_suggestions, pattern=r"^pick_none$"
+                    ),
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel_any)],
@@ -217,11 +234,21 @@ async def _build_and_start_application():
         ConversationHandler(
             entry_points=[MessageHandler(filters.Regex("^▶️ Start$"), new_entry)],
             states={
-                N_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_name)],
-                N_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_addr)],
-                N_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_contact)],
-                N_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_phone)],
-                N_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_notes)],
+                N_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_name)
+                ],
+                N_ADDR: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_addr)
+                ],
+                N_CONTACT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_contact)
+                ],
+                N_PHONE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_phone)
+                ],
+                N_NOTES: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, new_collect_notes)
+                ],
                 N_CONFIRM: [
                     CallbackQueryHandler(new_confirm_yes, pattern=r"^new_ok$"),
                     CallbackQueryHandler(new_confirm_no, pattern=r"^new_cancel$"),
@@ -243,6 +270,7 @@ async def _build_and_start_application():
     _app_ready.set()
     log.info("Telegram application started")
 
+
 def start_background_loop():
     """Create event loop in background thread and start PTB app."""
     global loop
@@ -253,15 +281,16 @@ def start_background_loop():
     ).start()
     _app_ready.wait()
 
+
 # =========================
 # Bot handlers
 # =========================
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
         "მოგესალმებით! 👋 ეს არის OK TV Hotel Bot — აირჩიეთ მოქმედება 👇",
         reply_markup=main_menu(),
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
@@ -272,14 +301,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu(),
     )
 
+
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("ბრძანება ვერ გავიგე. აირჩიე მენიუდან ⬇️", reply_markup=main_menu())
+    await update.effective_message.reply_text(
+        "ბრძანება ვერ გავიგე. აირჩიე მენიუდან ⬇️", reply_markup=main_menu()
+    )
+
 
 async def fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("აირჩიე მოქმედება ⬇️", reply_markup=main_menu())
+    await update.effective_message.reply_text(
+        "აირჩიე მოქმედება ⬇️", reply_markup=main_menu()
+    )
+
 
 # ----- SEARCH FLOW -----
-
 async def search_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.effective_message.reply_text(
@@ -287,6 +322,7 @@ async def search_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
     return S_NAME
+
 
 async def search_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_message.text.strip()
@@ -297,16 +333,19 @@ async def search_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return S_ADDR
 
+
 async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = update.effective_message.text.strip()
     context.user_data["search_addr_ka"] = addr
 
     hotels = read_all_hotels()
-    matches = best_matches(hotels, context.user_data["search_name_en"], addr, limit=5)
+    matches = best_matches(
+        hotels, context.user_data["search_name_en"], addr, limit=5
+    )
 
     if not matches:
         await update.effective_message.reply_text(
-            "ვერ ვიპოვე მსგავსი ჩანაწერი Sheet-ში. შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით.",
+            "ვერ ვიპოვე მსგავსი ჩანაწერი Sheet-ში. შეგიძლია გააგრძელო ▶️ *Start* ღილაკით.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu(),
         )
@@ -330,23 +369,32 @@ async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE
     buttons = []
     text_lines = ["შეიძლება इनमें ერთ-ერთს გულისხმობდე?"]
     for idx, (h, sc) in enumerate(matches, start=1):
-        text_lines.append(f"{idx}) {h['name']} — {h['address']} (სიმსგავსება {sc}%)")
-        buttons.append([InlineKeyboardButton(f"{idx}) აირჩიე", callback_data=f"pick_{idx-1}")])
-    buttons.append([InlineKeyboardButton("არაფერი არ ემთხვევა", callback_data="pick_none")])
+        text_lines.append(
+            f"{idx}) {h['name']} — {h['address']} (სიმსგავსება {sc}%)"
+        )
+        buttons.append(
+            [InlineKeyboardButton(f"{idx}) აირჩიე", callback_data=f"pick_{idx-1}")]
+        )
+    buttons.append(
+        [InlineKeyboardButton("არაფერი არ ემთხვევა", callback_data="pick_none")]
+    )
 
     context.user_data["search_suggestions"] = matches
 
     await update.effective_message.reply_text(
-        "\n".join(text_lines),
+        "\ნ".join(text_lines),
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return S_CONFIRM
+
 
 async def search_pick_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     idx = int(q.data.split("_")[1])
-    matches: List[Tuple[Dict[str, Any], int]] = context.user_data.get("search_suggestions", [])
+    matches: List[Tuple[Dict[str, Any], int]] = context.user_data.get(
+        "search_suggestions", []
+    )
     if idx < 0 or idx >= len(matches):
         await q.edit_message_text("არასწორი არჩევანი.")
         return ConversationHandler.END
@@ -363,6 +411,7 @@ async def search_pick_suggestion(update: Update, context: ContextTypes.DEFAULT_T
     )
     return ConversationHandler.END
 
+
 async def search_decline_suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -370,13 +419,13 @@ async def search_decline_suggestions(update: Update, context: ContextTypes.DEFAU
     context.user_data["expected_addr"] = context.user_data.get("search_addr_ka")
 
     await q.edit_message_text(
-        "ოკ! შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით და შევავსოთ ახალი ჩანაწერი.",
+        "ოკ! შეგიძლია გააგრძელო ▶️ *Start* ღილაკით და შევავსოთ ახალი ჩანაწერი.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
 
-# ----- NEW / START FLOW -----
 
+# ----- NEW / START FLOW -----
 async def new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "დავიწყოთ ახალი ჩანაწერი.\n\n"
@@ -384,6 +433,7 @@ async def new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
     return N_NAME
+
 
 async def new_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_message.text.strip()
@@ -402,6 +452,7 @@ async def new_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return N_ADDR
 
+
 async def new_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = update.effective_message.text.strip()
     context.user_data["new_addr"] = addr
@@ -416,15 +467,18 @@ async def new_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("კონტაქტის სახელი (ვინ გვპასუხობს?):")
     return N_CONTACT
 
+
 async def new_collect_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["contact_name"] = update.effective_message.text.strip()
     await update.effective_message.reply_text("კონტაქტის ტელეფონი:")
     return N_PHONE
 
+
 async def new_collect_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["contact_phone"] = update.effective_message.text.strip()
     await update.effective_message.reply_text("შენიშვნები / კომენტარი:")
     return N_NOTES
+
 
 async def new_collect_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["notes"] = update.effective_message.text.strip()
@@ -449,8 +503,11 @@ async def new_collect_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ გაუქმება", callback_data="new_cancel")],
         ]
     )
-    await update.effective_message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await update.effective_message.reply_text(
+        preview, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+    )
     return N_CONFIRM
+
 
 async def new_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -468,10 +525,11 @@ async def new_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_new_row(payload)
 
     await q.edit_message_text(
-        f"{green_check()} ჩანაწერი წარმატებით ჩაიწერა Sheet-ში. გმადლობთ!",
+        f"{green_check()} ჩანაწერი წარმატებით ჩაიწერა Sheet-ში. გმადლობთ!"
     )
     context.user_data.clear()
     return ConversationHandler.END
+
 
 async def new_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -480,34 +538,48 @@ async def new_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
+
 async def cancel_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.effective_message.reply_text("გაუქმებულია.", reply_markup=main_menu())
     return ConversationHandler.END
 
+
 # =========================
 # Flask routes
 # =========================
-
 @app.get("/")
 def health() -> Response:
     return Response("OK", status=200)
 
+
 @app.get("/set_webhook")
 def set_webhook():
+    """
+    აყენებს Telegram webhook-ს:
+    https://<APP_BASE_URL>/webhook/<TELEGRAM_TOKEN>
+    """
     url = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+
     async def _do():
+        # drop_pending_updates True -> აღარ მოვა ძველი რიგში დაყოვნებული აპდეიტები
         await application.bot.set_webhook(url=url, drop_pending_updates=True)
+
     fut = asyncio.run_coroutine_threadsafe(_do(), loop)
-    fut.result(timeout=15)
+    fut.result(timeout=30)  # ცოტა დიდი ტაიმაუითი
     log.info("Webhook set (masked): %s/*** -> True", APP_BASE_URL)
     return jsonify(ok=True, url=url)
 
+
 @app.post(f"/webhook/{TELEGRAM_TOKEN}")
 def telegram_webhook():
+    """
+    Telegram-ს აქ მოაქვს Update-ები POST-ით.
+    """
     update_json = request.get_json(force=True, silent=True)
     if not update_json:
         return jsonify(ok=False)
+
     update = Update.de_json(update_json, application.bot)
 
     async def _process():
@@ -516,22 +588,26 @@ def telegram_webhook():
     asyncio.run_coroutine_threadsafe(_process(), loop)
     return jsonify(ok=True)
 
+
 # =========================
 # START PTB & SET WEBHOOK (after everything is defined)
 # =========================
-
 # ვრთავთ ბოტს მხოლოდ ახლა, როცა ყველა ჰენდლერი გამოცხადებულია
 start_background_loop()
 
-# აპის გაშვებისას ერთი ჯერ მოვახდინოთ webhook-ის დაყენება
+# აპის გაშვებისას ერთჯერადად ვცდილობთ webhook-ის დაყენებას,
+# თუ ვერ შეძლო (მაგ. ინტერნეტის ლაგი) — /set_webhook ენდპოინტით ხელახლა დაყენებ.
 with app.app_context():
     try:
-        url = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
-        async def _do():
-            await application.bot.set_webhook(url=url, drop_pending_updates=True)
-        fut = asyncio.run_coroutine_threadsafe(_do(), loop)
-        fut.result(timeout=20)
-        log.info("Webhook set (masked): %s/*** -> True", APP_BASE_URL)
+        if not _started_webhook_once:
+            url = f"{APP_BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+
+            async def _do():
+                await application.bot.set_webhook(url=url, drop_pending_updates=True)
+
+            fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+            fut.result(timeout=30)
+            log.info("Webhook set at startup (masked): %s/*** -> True", APP_BASE_URL)
     except Exception as e:
         log.warning("Webhook set failed initially: %s", e)
 
