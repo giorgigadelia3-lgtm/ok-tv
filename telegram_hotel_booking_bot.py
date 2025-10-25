@@ -3,11 +3,11 @@ import json
 import logging
 import threading
 import asyncio
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify, Response
 
-from fuzzywuzzy import fuzz, process
+from fuzzywuzzy import fuzz
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -79,21 +79,22 @@ def _sa_client():
 def open_sheet():
     gc = _sa_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    # პირველი worksheet — შეგიძლია შეცვალო სახელით თუ გჭირდება
+    # პირველი worksheet — სურვილისამებრ შეგიძლია შეცვალო სახელით
     ws = sh.sheet1
     return ws
 
 # ვიგულვოთ სვეტების სტრუქტურა:
 # A: Hotel Name (EN)
 # B: Address (KA)
-# C: Status  (e.g., ✅ Surveyed / ❌ Already / NEW)
+# C: Status
 # D: Comment
-# E+: სხვა ველები (ჩასაწერი ბოტიდან როცა ახალია)
+# E: Contact Name
+# F: Contact Phone
+# G: Notes
 
 def read_all_hotels() -> List[Dict[str, Any]]:
     ws = open_sheet()
     values = ws.get_all_records()
-    # მოამზადე სტანდარტული ფორმატი
     normalized = []
     for row in values:
         normalized.append({
@@ -107,7 +108,6 @@ def read_all_hotels() -> List[Dict[str, Any]]:
 
 def append_new_row(payload: Dict[str, Any]) -> None:
     ws = open_sheet()
-    # აკურატულად შეავსე — თუ გაგაჩნია სხვა სვეტებიც, დაამატე აქ
     ws.append_row(
         [
             payload.get("name", ""),
@@ -145,11 +145,9 @@ def best_matches(
     return res[:limit]
 
 def is_strong_match(score: int) -> bool:
-    # 90%-ზე მეტი — ვთვლით ზუსტ ან თითქმის ზუსტ დამთხვევად
     return score >= 90
 
 def is_close_match(score: int) -> bool:
-    # ახლოსაა, მაგრამ არა აბსოლუტურად ზუსტი
     return score >= 70
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -178,7 +176,7 @@ S_NAME, S_ADDR, S_CONFIRM = range(3)
 N_NAME, N_ADDR, N_CONTACT, N_PHONE, N_NOTES, N_CONFIRM = range(6)
 
 # =========================
-# PTB Application — background loop
+# PTB Application (will be started later)
 # =========================
 
 application: Application
@@ -186,6 +184,7 @@ loop: asyncio.AbstractEventLoop
 _app_ready = threading.Event()
 
 async def _build_and_start_application():
+    """Build & start PTB application in background loop."""
     global application
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -245,12 +244,14 @@ async def _build_and_start_application():
     log.info("Telegram application started")
 
 def start_background_loop():
+    """Create event loop in background thread and start PTB app."""
     global loop
     loop = asyncio.new_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(_build_and_start_application()), daemon=True).start()
+    threading.Thread(
+        target=lambda: loop.run_until_complete(_build_and_start_application()),
+        daemon=True,
+    ).start()
     _app_ready.wait()
-
-start_background_loop()
 
 # =========================
 # Bot handlers
@@ -258,15 +259,15 @@ start_background_loop()
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
-        "გამარჯობა! აირჩიე მოქმედება 👇",
+        "მოგესალმებით! 👋 ეს არის OK TV Hotel Bot — აირჩიეთ მოქმედება 👇",
         reply_markup=main_menu(),
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
-        "🔎 *მოძებნა* — ჯერ შეიყვანე სასტუმროს ოფიციალური სახელი (ინგლisch), შემდეგ მისი მისამართი (ქართული). "
-        "ბოტი შეადარებს Sheets-ში არსებულ მონაცემებს და გეტყვის უკვე გამოკითხულია თუ არა.\n\n"
-        "▶️ *Start* — დაიწყო ახალ ობიექტზე შეკითხვები და შედეგი ჩაიწერება Sheet-ში.",
+        "🔎 *მოძებნა* — ჯერ შეიყვანე სასტუმროს ოფიციალური სახელი (ინგლისურად), "
+        "შემდეგ მისი ოფიციალური მისამართი (ქართულად). ბოტი გადაამოწმებს Google Sheets-ში.\n\n"
+        "▶️ *Start* — ახალი ობიექტის შევსება და ავტომატური ჩაწერა Sheet-ში.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu(),
     )
@@ -275,7 +276,6 @@ async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("ბრძანება ვერ გავიგე. აირჩიე მენიუდან ⬇️", reply_markup=main_menu())
 
 async def fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # თუ ტექსტი მოვიდა უშუალოდ — გადამისამართე მენიუზე
     await update.effective_message.reply_text("აირჩიე მოქმედება ⬇️", reply_markup=main_menu())
 
 # ----- SEARCH FLOW -----
@@ -301,7 +301,6 @@ async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE
     addr = update.effective_message.text.strip()
     context.user_data["search_addr_ka"] = addr
 
-    # მოძებნე Sheet-ში
     hotels = read_all_hotels()
     matches = best_matches(hotels, context.user_data["search_name_en"], addr, limit=5)
 
@@ -311,12 +310,10 @@ async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu(),
         )
-        # შევინახოთ მოკლე „მოლოდინები“ რათა Start-ზე შევადაროთ
         context.user_data["expected_name"] = context.user_data["search_name_en"]
         context.user_data["expected_addr"] = context.user_data["search_addr_ka"]
         return ConversationHandler.END
 
-    # თუ ძალიან ძლიერი დამთხვევაა — მიგვაჩნია, რომ უკვე არსებობს
     best_hotel, score = matches[0]
     if is_strong_match(score):
         comment = best_hotel.get("comment") or "კომენტარი არ არის."
@@ -330,14 +327,11 @@ async def search_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return ConversationHandler.END
 
-    # სხვა შემთხვევაში — შევთავაზოთ „ეს ხომ არ არის?“ ვარიანტები
     buttons = []
     text_lines = ["შეიძლება इनमें ერთ-ერთს გულისხმობდე?"]
     for idx, (h, sc) in enumerate(matches, start=1):
-        text_lines.append(f"{idx}) {h['name']} — {h['address']} (სიმსგავსე {sc}%)")
-        buttons.append(
-            [InlineKeyboardButton(f"{idx}) აირჩიე", callback_data=f"pick_{idx-1}")]
-        )
+        text_lines.append(f"{idx}) {h['name']} — {h['address']} (სიმსგავსება {sc}%)")
+        buttons.append([InlineKeyboardButton(f"{idx}) აირჩიე", callback_data=f"pick_{idx-1}")])
     buttons.append([InlineKeyboardButton("არაფერი არ ემთხვევა", callback_data="pick_none")])
 
     context.user_data["search_suggestions"] = matches
@@ -357,7 +351,7 @@ async def search_pick_suggestion(update: Update, context: ContextTypes.DEFAULT_T
         await q.edit_message_text("არასწორი არჩევანი.")
         return ConversationHandler.END
 
-    hotel, score = matches[idx]
+    hotel, _score = matches[idx]
     comment = hotel.get("comment") or "კომენტარი არ არის."
 
     await q.edit_message_text(
@@ -367,18 +361,16 @@ async def search_pick_suggestion(update: Update, context: ContextTypes.DEFAULT_T
         f"*კომენტარი:* _{comment}_",
         parse_mode=ParseMode.MARKDOWN,
     )
-    # დასრულება — ჩატი ავტომატურად მთავრდება „უკვე გამოკითხულია“ შემთხვევაში
     return ConversationHandler.END
 
 async def search_decline_suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    # შევინახოთ რომ „ვარიანტები არ ემთხვეოდა“ — და მივცეთ Start
     context.user_data["expected_name"] = context.user_data.get("search_name_en")
     context.user_data["expected_addr"] = context.user_data.get("search_addr_ka")
 
     await q.edit_message_text(
-        "ოკ! მაშინ შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით და შევავსოთ ახალი ჩანაწერი.",
+        "ოკ! შეგიძლიათ გააგრძელოთ ▶️ *Start* ღილაკით და შევავსოთ ახალი ჩანაწერი.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
@@ -397,12 +389,11 @@ async def new_collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_message.text.strip()
     context.user_data["new_name"] = name
 
-    # თუ Search-იდან იყო მოლოდინი — შევადაროთ
     exp = context.user_data.get("expected_name")
     if exp and normalize(exp) != normalize(name):
         await update.effective_message.reply_text(
-            f"ℹ️ შენ მიერ შეყვანილი სახელი ({name}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
-            "დარწმუნდე, რომ სწორად წერ. თუ ყველაფერი სწორია, გავაგრძელოთ.",
+            f"ℹ️ შეყვანილი სახელი ({name}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
+            "გთხოვ გადაამოწმე. თუ სწორია, გავაგრძელოთ.",
         )
 
     await update.effective_message.reply_text(
@@ -418,7 +409,7 @@ async def new_collect_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exp = context.user_data.get("expected_addr")
     if exp and normalize(exp) != normalize(addr):
         await update.effective_message.reply_text(
-            f"ℹ️ შენ მიერ შეყვანილი მისამართი ({addr}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
+            f"ℹ️ შეყვანილი მისამართი ({addr}) განსხვავდება ადრე მოძიებულისგან ({exp}). "
             "გთხოვ გადაამოწმე. თუ სწორია, გავაგრძელოთ.",
         )
 
@@ -514,7 +505,6 @@ def set_webhook():
 
 @app.post(f"/webhook/{TELEGRAM_TOKEN}")
 def telegram_webhook():
-    # მიიღე update და გადააწოდე PTB-ს
     update_json = request.get_json(force=True, silent=True)
     if not update_json:
         return jsonify(ok=False)
@@ -525,6 +515,13 @@ def telegram_webhook():
 
     asyncio.run_coroutine_threadsafe(_process(), loop)
     return jsonify(ok=True)
+
+# =========================
+# START PTB & SET WEBHOOK (after everything is defined)
+# =========================
+
+# ვრთავთ ბოტს მხოლოდ ახლა, როცა ყველა ჰენდლერი გამოცხადებულია
+start_background_loop()
 
 # აპის გაშვებისას ერთი ჯერ მოვახდინოთ webhook-ის დაყენება
 with app.app_context():
