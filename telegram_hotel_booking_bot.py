@@ -451,3 +451,9 @@ set_webhook()
 # gunicorn აგრძნობს `app`
 # Start command on Render:
 #   gunicorn telegram_hotel_booking_bot:app --bind 0.0.0.0:$PORT --timeout 120
+try:
+    bot.remove_webhook()
+    time.sleep(2)
+    bot.set_webhook(url=url_webhook)
+except Exception as e:
+    print(f"Webhook set error: {e}")
