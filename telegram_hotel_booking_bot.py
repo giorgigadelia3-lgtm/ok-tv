@@ -85,23 +85,78 @@ def kbd_main():
         "resize_keyboard": True
     }
 
+# -------- Normalization & similarity utils --------
+
+# საერთო სიტყვები, რომლებიც სახელიდან უნდა მოიშოროს შედარებისთვის
+GENERIC_NAME_WORDS = {
+    "hotel","hotels","inn","residence","palace","boutique","hostel","guesthouse","guest","house",
+    "apart","aparthotel","apartments","spa","resort","lodge","line","grand","old","new","the"
+}
+
+def _strip_punct(s: str) -> str:
+    return re.sub(r"[^\w\u10A0-\u10FF ]+", " ", s)
+
 def normalize_text(s: str) -> str:
-    """Lowercase; collapse spaces; strip punctuation except Georgian/latin/digits."""
+    """Lowercase; collapse spaces; strip punctuation except Georgian/latin/digits to spaces; trim."""
     if not s:
         return ""
     s = s.strip().lower()
+    s = _strip_punct(s)
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^\w\u10A0-\u10FF ]+", "", s)
-    return s
+    return s.strip()
 
-def soft_key(s: str) -> str:
-    if not s: return ""
-    s = s.strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+def normalize_name_en(name: str) -> str:
+    """მოაშორებს generic სიტყვებს და დაუტოვებს ინფორმაციულ ბირთვს."""
+    s = normalize_text(name)
+    tokens = [t for t in s.split() if t not in GENERIC_NAME_WORDS]
+    return " ".join(tokens) if tokens else s
 
-def similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, soft_key(a), soft_key(b)).ratio()
+def tokenize(s: str):
+    s = normalize_text(s)
+    return [t for t in s.split() if t]
+
+def token_set(s: str) -> set:
+    return set(tokenize(s))
+
+def token_sort_str(s: str) -> str:
+    toks = tokenize(s)
+    toks.sort()
+    return " ".join(toks)
+
+def ratio(a: str, b: str) -> float:
+    """SequenceMatcher ratio 0..1 on raw strings."""
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def token_sort_ratio(a: str, b: str) -> float:
+    """SequenceMatcher ratio 0..1 on token-sorted strings (order-insensitive)."""
+    return ratio(token_sort_str(a), token_sort_str(b))
+
+def jaccard(a_set: set, b_set: set) -> float:
+    if not a_set or not b_set:
+        return 0.0
+    inter = len(a_set & b_set)
+    union = len(a_set | b_set)
+    return inter / union if union else 0.0
+
+def looks_like_phone(text: str) -> bool:
+    s = re.sub(r"[^\d+]", "", text)
+    return bool(re.fullmatch(r"(\+?\d{9,15})", s))
+
+def looks_like_email(text: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", text.strip()))
+
+def is_valid_name_en(text: str) -> bool:
+    # ოფიციალური სახელი ინგლისურად — თუმცა რეალურად მხოლოდ ლათინური სიმბოლოს არსებობა და მინიმუმ 2 სიმბოლო
+    return bool(re.search(r"[A-Za-z]", text)) and len(text.strip()) >= 2
+
+def is_valid_addr_ka(text: str) -> bool:
+    # მისამართი ქართულად — ქართულ ასოებს მაინც უნდა შეიცავდეს
+    return bool(re.search(r"[\u10A0-\u10FF]", text)) and len(text.strip()) >= 3
+
+def red_x() -> str:
+    return "🔴✖️"
+
+# -------- Sheets helpers --------
 
 def get_all_hotels():
     if not sheet:
@@ -156,21 +211,68 @@ def append_hotel_row(hotel_name, address, comment="", contact="", agent="", time
     except Exception as e:
         return False, str(e)
 
-def red_x() -> str:
-    return "🔴✖️"
+# -------- Core matching logic (NEW) --------
 
-def is_valid_name_en(text: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", text)) and len(text.strip()) >= 2
+def build_row_profile(row: dict):
+    """ამზადებს რიგის პროფილს შედარებისთვის."""
+    r_name_raw = str(row.get("hotel name", "") or "").strip()
+    r_addr_raw = str(row.get("address", "") or "").strip()
 
-def is_valid_addr_ka(text: str) -> bool:
-    return bool(re.search(r"[\u10A0-\u10FF]", text)) and len(text.strip()) >= 3
+    name_core = normalize_name_en(r_name_raw)
+    addr_tokens = token_set(r_addr_raw)
 
-def looks_like_phone(text: str) -> bool:
-    s = re.sub(r"[^\d+]", "", text)
-    return bool(re.fullmatch(r"(\+?\d{9,15})", s))
+    return {
+        "row": row,
+        "name_raw": r_name_raw,
+        "addr_raw": r_addr_raw,
+        "name_core": name_core,
+        "addr_tokens": addr_tokens,
+        "addr_sort": token_sort_str(r_addr_raw),
+    }
 
-def looks_like_email(text: str) -> bool:
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", text.strip()))
+def score_candidate(profile, in_name_raw: str, in_addr_raw: str):
+    """ითვლის რამდენიმე მეტრიკას და აბრუნებს საერთო ქულას."""
+    in_name_core = normalize_name_en(in_name_raw)
+    in_addr_tokens = token_set(in_addr_raw)
+    in_addr_sort = token_sort_str(in_addr_raw)
+
+    # სახელის ქულები
+    name_ratio = ratio(profile["name_core"], in_name_core)
+    name_sort_ratio = token_sort_ratio(profile["name_core"], in_name_core)
+
+    # მისამართის ქულები
+    addr_j = jaccard(profile["addr_tokens"], in_addr_tokens)
+    addr_ratio = difflib.SequenceMatcher(None, profile["addr_sort"], in_addr_sort).ratio()
+
+    # საერთო ჰევიური აგრეგატი
+    # სახელს უფრო მაღალი წონა აქვს, რადგან შეიძლება მისამართი ოდნავ განსხვავდებოდეს
+    total = (name_ratio * 0.55) + (name_sort_ratio * 0.15) + (addr_j * 0.20) + (addr_ratio * 0.10)
+
+    return {
+        "total": round(total, 4),
+        "name_ratio": round(name_ratio, 4),
+        "name_sort_ratio": round(name_sort_ratio, 4),
+        "addr_jaccard": round(addr_j, 4),
+        "addr_ratio": round(addr_ratio, 4),
+    }
+
+def is_confident_match(scores) -> bool:
+    """გადაწყვეტს, ითვლება თუ არა ჩანაწერი ნაპოვნად."""
+    nr = scores["name_ratio"]
+    ns = scores["name_sort_ratio"]
+    aj = scores["addr_jaccard"]
+    ar = scores["addr_ratio"]
+
+    # ძირითადი წესები (მაღალი ზუსტიობები)
+    if nr >= 0.84 and (aj >= 0.50 or ar >= 0.75):
+        return True
+    if ns >= 0.90:
+        return True
+    # კომპრომისული ვარიანტი — ორივე საშუალო
+    if nr >= 0.78 and aj >= 0.40:
+        return True
+
+    return False
 
 # =========================
 # 5) STATE (in-memory)
@@ -241,7 +343,6 @@ def _process_update():
 
     # Enforce workflow: first SEARCH, then START (unless already allowed)
     if t == "▶️ სტარტი" and not st.get("search_ready_for_form", False):
-        # Not allowed yet – push them to search
         send_message(chat_id, "საწყისად გამოიყენე <b>🔍 მოძებნა</b>, რომ გადავამოწმოთ სასტუმრო ბაზაშია თუ არა. მერე გაგრძელდება სტარტი.", kbd_main())
         return jsonify({"ok": True})
 
@@ -278,25 +379,22 @@ def _process_update():
 
         in_name = st["name_en"]
         in_addr = st["addr_ka"]
-        name_norm = normalize_text(in_name)
-        addr_norm = normalize_text(in_addr)
 
-        exact_row = None
-        cands = []
-        for row in hotels:
-            r_name = str(row.get("hotel name", "")).strip()
-            r_addr = str(row.get("address", "")).strip()
+        # --- NEW: ძლიერი მოძებნა ---
+        profiles = [build_row_profile(r) for r in hotels]
 
-            if normalize_text(r_name) == name_norm and normalize_text(r_addr) == addr_norm:
-                exact_row = row
+        confident_hit = None
+        scored = []
+
+        for p in profiles:
+            s = score_candidate(p, in_name, in_addr)
+            if is_confident_match(s):
+                confident_hit = p  # პირველი საკმარისია: ფაქტია, რომ ბაზაშია
                 break
+            scored.append({"profile": p, "scores": s})
 
-            score = (similarity(r_name, in_name) * 0.6) + (similarity(r_addr, in_addr) * 0.4)
-            if score >= 0.67:
-                cands.append({"row": row, "score": round(score, 3)})
-
-        if exact_row:
-            comment = str(exact_row.get("comment", "") or "—")
+        if confident_hit:
+            comment = str(confident_hit["row"].get("comment", "") or "—")
             send_message(
                 chat_id,
                 f"{red_x()} <b>ეს სასტუმრო უკვე გამოკვლეულია</b> და ბაზაშია.\n"
@@ -307,25 +405,40 @@ def _process_update():
             reset_state(chat_id)
             return jsonify({"ok": True})
 
-        if cands:
-            cands.sort(key=lambda x: x["score"], reverse=True)
-            st["candidates"] = cands[:3]
+        # არ გვყავს „დაჯერებული“ თანამთხვევა — ვაჩვენოთ TOP მსგავსი ჩანაწერები
+        # შევადგინოთ ერთიანი სქორი სორტირებისთვის
+        def total_key(item):
+            return item["scores"]["total"]
+
+        scored.sort(key=total_key, reverse=True)
+        # ფილტრაცია: მხოლოდ ის, ვინც რეალურად ჰგავს (გონივრული ბარიერი)
+        candidates = [c for c in scored if c["scores"]["total"] >= 0.60][:3]
+
+        if candidates:
+            st["candidates"] = [
+                {"row": c["profile"]["row"], "score": c["scores"]["total"]}
+                for c in candidates
+            ]
             lines = []
             kb_rows = []
             for i, c in enumerate(st["candidates"], start=1):
                 r = c["row"]
-                lines.append(f"{i}) <b>{r.get('hotel name','')}</b>\n   📍 {r.get('address','')}")
+                lines.append(
+                    f"{i}) <b>{r.get('hotel name','')}</b>\n"
+                    f"   📍 {r.get('address','')}\n"
+                    f"   (similarity: {c['score']:.2f})"
+                )
                 kb_rows.append([{"text": str(i)}])
             kb_rows.append([{"text": "სხვა სასტუმროა"}])
             send_message(
                 chat_id,
-                "ზუსტად ვერ ვიპოვე, მაგრამ არის <b>მსგავსი</b> ჩანაწერები. რომელიმეს ეძებ?\n\n" + "\n\n".join(lines),
+                "ზუსტია ვერ ვიპოვე, მაგრამ არის <b>ძალიან მსგავსი</b> ჩანაწერები. რომელიმეს ეძებ?\n\n" + "\n\n".join(lines),
                 {"keyboard": kb_rows, "resize_keyboard": True}
             )
             st["step"] = "search_similar"
             return jsonify({"ok": True})
 
-        # no candidates at all – allow START
+        # საერთოდ ვერაფერი მოიძებნა — მივცეთ გაგრძელება
         st["search_ready_for_form"] = True
         st["step"] = None
         send_message(chat_id, "✅ ბაზაში ასეთი ჩანაწერი <b>არ არის</b>. ახლა შეგიძლია გაფორმო.\nდააჭირე 👉 <b>▶️ სტარტი</b>.", kbd_main())
@@ -348,7 +461,6 @@ def _process_update():
                 return jsonify({"ok": True})
 
         if t == "სხვა სასტუმროა":
-            # allow to continue with the form
             st["search_ready_for_form"] = True
             st["step"] = None
             send_message(chat_id, "გასაგებია. ახლა შეგიძლია შეავსო ინფორმაცია. დააჭირე 👉 <b>▶️ სტარტი</b>.", kbd_main())
@@ -384,7 +496,6 @@ def _process_update():
             return jsonify({"ok": True})
         st["agent"] = t
 
-        # WRITE to sheet
         ok, err = append_hotel_row(
             hotel_name=st.get("name_en"),
             address=st.get("addr_ka"),
